@@ -136,6 +136,10 @@ def _construct(cls, config: dict):
     Only keys matching constructor parameters are forwarded, so sections may
     carry documentation or future fields safely.
     """
+    if not isinstance(config, dict):
+        raise ConfigError(
+            f"{cls.__name__} needs a config section, got {type(config).__name__}"
+        )
     params = _constructor_params(cls)
     kwargs = {}
     for key, value in config.items():

@@ -57,14 +57,9 @@ HINT = "tab/enter completes · up/down selects · esc dismisses"
 _ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
 
 
-def visible_len(text: str) -> int:
-    """Width of ``text`` as printed, ignoring ANSI colour escapes.
-
-    The console prompt is styled, so ``len(prompt)`` counts escape bytes
-    that occupy no columns. Using it to place the cursor slides the caret
-    to the right of where the text actually ends.
-    """
-    return len(_ANSI_RE.sub("", text))
+# Re-exported: this is where the editor's callers have always imported
+# it from. The implementation now lives in one place for every module.
+from mantra.term import raw_mode, visible_len  # noqa: F401
 
 
 @dataclass
@@ -362,35 +357,17 @@ class LineEditor:
 
     @contextmanager
     def _raw_mode(self):
-        if os.name == "nt":
-            # Enable VT mouse tracking on Windows so scroll wheel works.
-            sys.stdout.write("\033[?1006h")  # SGR extended mouse mode
-            sys.stdout.write("\033[?1003h")  # enable all mouse motion
-            sys.stdout.flush()
-            try:
-                yield
-            finally:
-                sys.stdout.write("\033[?1003l")  # disable mouse motion
-                sys.stdout.write("\033[?1006l")  # disable SGR mouse
-                sys.stdout.flush()
-            return
-        import termios
-        import tty
-
-        fd = sys.stdin.fileno()
-        original = termios.tcgetattr(fd)
+        """Single-key input, with mouse tracking on for the scroll wheel."""
+        sys.stdout.write("\033[?1006h")  # SGR extended mouse mode
+        sys.stdout.write("\033[?1003h")  # all mouse motion
+        sys.stdout.flush()
         try:
-            tty.setraw(fd)
-            # Enable VT mouse tracking on POSIX so scroll wheel works.
-            sys.stdout.write("\033[?1006h")
-            sys.stdout.write("\033[?1003h")
-            sys.stdout.flush()
-            yield
+            with raw_mode():
+                yield
         finally:
             sys.stdout.write("\033[?1003l")
             sys.stdout.write("\033[?1006l")
             sys.stdout.flush()
-            termios.tcsetattr(fd, termios.TCSADRAIN, original)
 
     def _read_key(self) -> str:
         if os.name == "nt":
@@ -432,11 +409,17 @@ class LineEditor:
         for scroll wheel events, or ``'key:mouse'`` for other buttons.
         """
         buf = ""
-        while True:
+        # Bounded, and stops at end of input: a read that returns nothing
+        # forever would hang the editor on a closed descriptor.
+        for _ in range(64):
             ch = sys.stdin.read(1)
+            if not ch:
+                return ""
             buf += ch
             if ch in ("M", "m"):
                 break
+        else:
+            return ""
         # SGR format: <button;col;rowM  (M = press, m = release)
         parts = buf.rstrip("Mm").split(";")
         try:

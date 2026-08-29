@@ -1,4 +1,5 @@
 # Generated / cache
+*.egg-info/
 __pycache__/
 *.pyc
 *.pyo

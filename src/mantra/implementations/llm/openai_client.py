@@ -12,8 +12,8 @@ display). Tool-call deltas are accumulated silently and returned complete.
 
 from __future__ import annotations
 
+import http.client
 import json
-import os
 import time
 import urllib.error
 import urllib.request
@@ -24,6 +24,10 @@ from mantra.core.keys import resolve as resolve_key
 from mantra.interfaces.llm_client import LLMClient, LLMResponse, ToolCall
 
 DeltaCallback = Callable[[str], None]
+
+# A connection dropped mid-stream surfaces as this rather than an OSError,
+# so it has to be named explicitly or it escapes the retry loop entirely.
+IncompleteRead = http.client.IncompleteRead
 
 
 def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMResponse:
@@ -73,14 +77,20 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
             if fn.get("arguments"):
                 slot["args"] += fn["arguments"]
 
-    tool_calls = [
-        ToolCall(
-            id=slot["id"] or f"call_{i}",
-            name=slot["name"],
-            arguments=json.loads(slot["args"] or "{}"),
+    tool_calls = []
+    for i, slot in sorted(tool_acc.items()):
+        try:
+            arguments = json.loads(slot["args"] or "{}")
+        except json.JSONDecodeError as exc:
+            # A stream cut mid-argument leaves partial JSON. That is a
+            # transport failure like any other, so it has to come out as
+            # one instead of a ValueError that nothing upstream catches.
+            raise LLMError(
+                f"the response ended mid-tool-call ({slot['name'] or 'call ' + str(i)}): {exc}"
+            ) from exc
+        tool_calls.append(
+            ToolCall(id=slot["id"] or f"call_{i}", name=slot["name"], arguments=arguments)
         )
-        for i, slot in sorted(tool_acc.items())
-    ]
     content = "".join(content_parts)
     return LLMResponse(content=content or None, tool_calls=tool_calls, usage=usage)
 
@@ -113,6 +123,10 @@ class OpenAICompatClient(LLMClient):
         self._usage_supported = include_usage
         # Nor reasoning_effort - local servers tend to reject it outright.
         self._reasoning_supported = reasoning_effort is not None
+        # Reasoning models ask for the completion budget under a different
+        # name. Remembered, or every turn pays for the same 400 again.
+        self._token_field = "max_tokens"
+        self._token_budget = max_tokens
         self.last_usage: dict | None = None
 
     def chat(
@@ -133,7 +147,7 @@ class OpenAICompatClient(LLMClient):
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            self._token_field: self._token_budget,
         }
         if tools:
             payload["tools"] = tools
@@ -177,11 +191,13 @@ class OpenAICompatClient(LLMClient):
                     self._reasoning_supported = False
                     del payload["reasoning_effort"]
                     continue
-                if exc.code == 400 and "max_completion_tokens" in detail \
-                        and "max_tokens" in payload:
+                if exc.code == 400 and self._token_field == "max_tokens" \
+                        and "max_completion_tokens" in detail:
                     # Reasoning models refuse max_tokens and want the
                     # completion budget named differently.
-                    payload["max_completion_tokens"] = payload.pop("max_tokens")
+                    self._token_field = "max_completion_tokens"
+                    payload.pop("max_tokens", None)
+                    payload["max_completion_tokens"] = self._token_budget
                     continue
                 if exc.code in (401, 403):
                     # Auth failures never succeed on retry; fail fast with cause.
@@ -189,10 +205,18 @@ class OpenAICompatClient(LLMClient):
                         f"the server rejected the key from '{self.api_key_env}' "
                         f"(HTTP {exc.code}) at {self.base_url}: {detail}"
                     ) from exc
+                if exc.code == 400:
+                    # We asked for something the server does not
+                    # understand. Sending it again unchanged cannot
+                    # succeed, and each attempt costs a round trip.
+                    raise LLMError(
+                        f"the server rejected the request (HTTP 400) at "
+                        f"{self.base_url}: {detail or 'no detail given'}"
+                    ) from exc
                 last_error = f"HTTP {exc.code}: {detail}"
                 if attempt < self.max_retries:
                     time.sleep(min(2**attempt, 8))
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            except (urllib.error.URLError, TimeoutError, OSError, IncompleteRead) as exc:
                 last_error = str(exc)
                 if attempt < self.max_retries:
                     time.sleep(min(2**attempt, 8))
@@ -224,9 +248,22 @@ class OpenAICompatClient(LLMClient):
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
+            raw = response.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise LLMError(
+                f"{self.base_url}/chat/completions did not return JSON: {exc}"
+            ) from exc
+        if not isinstance(data, dict) or not data.get("choices"):
+            # An empty choices array is what a gateway returns when it
+            # accepts the request and then has nothing to say. Indexing
+            # it raised an IndexError that nothing upstream caught.
+            raise LLMError(
+                f"{self.base_url}/chat/completions returned no choices"
+            )
 
-        message = data["choices"][0]["message"]
+        message = (data["choices"][0] or {}).get("message") or {}
         raw_calls = message.get("tool_calls") or []
         tool_calls = [
             ToolCall(

@@ -29,6 +29,19 @@ _DESTRUCTIVE = (
     r"rm\s+(-[rRfF]+\s+)*[^\s]*\s*(-[rRfF]+)",  # rm -rf / rm -fr
     r"\brm\s+-[rR]",
     r"\brmdir\b",
+    # The non-POSIX recursive delete is spelled "rd" far more often than
+    # "rmdir" in practice, and the short form was the one that slipped
+    # through to auto-approval.
+    r"\brd\b\s+/[sSqQ]",
+    r"\berase\b\s+/[fFqQ]",
+    r"\bkill\b",
+    r"\bpkill\b",
+    r"\bkillall\b",
+    r"\bchown\b",
+    r"docker\s+rm\b",
+    r"git\s+stash\s+drop\b",
+    r"git\s+branch\s+-D\b",
+    r"git\s+push\b[^\n]*--delete\b",
     r"\bformat\s+[a-zA-Z]{1,2}:",  # format C: - not "--format=..." flags
     r"\bmkfs\b",
     r"\bdd\b\s+if=",
@@ -51,7 +64,7 @@ _DESTRUCTIVE = (
     r"\biex\b",
     r"Invoke-Expression",
     r"Set-ExecutionPolicy",
-    r"\bchmod\s+777\b",
+    r"\bchmod\b[^\n]*777",
     r"\bsudo\b",
     r"\breg\s+delete\b",
     r"\bnet\s+user\b",
@@ -76,8 +89,31 @@ _SAFE_COMMANDS = (
     r"^\s*dotnet\s+test\b",
 )
 
+# Side effects that make an otherwise read-only command write. Matching
+# the leading verb alone classified "find . -delete" and "echo x > file"
+# as safe, so the command ran unconfirmed in every mode. A quote-wrapped
+# ">" is over-caught here; erring towards asking is the right direction.
+_WRITE_EFFECT_RE = re.compile(
+    r"(?<![\d&])>{1,2}\s*(?!&\d)\S"  # output redirection, not 2>&1
+    r"|\btee\b"
+    r"|\s-(delete|exec|ok|fdelete)\b",
+    re.IGNORECASE,
+)
+
 _DESTRUCTIVE_RE = re.compile("|".join(_DESTRUCTIVE), re.IGNORECASE)
 _SAFE_RE = re.compile("|".join(_SAFE_COMMANDS), re.IGNORECASE)
+
+# Statement separators. Every statement has to be safe for the whole to
+# be safe, so these are applied unconditionally rather than only when a
+# separator happens to be present.
+_STATEMENT_RE = re.compile(r"\s*(?:;|\|\||\&\&|\||\n)\s*")
+
+
+def _statement_is_safe(statement: str) -> bool:
+    """Safe means an allowlisted verb *and* nothing that writes."""
+    if not _SAFE_RE.match(statement):
+        return False
+    return not _WRITE_EFFECT_RE.search(statement)
 
 
 def classify_command(command: str) -> str:
@@ -86,9 +122,12 @@ def classify_command(command: str) -> str:
         return "safe"
     if _DESTRUCTIVE_RE.search(command):
         return "destructive"
-    if _SAFE_RE.match(command):
-        return "safe"
-    return "mutating"
+    for part in _STATEMENT_RE.split(command):
+        if not part.strip():
+            continue
+        if not _statement_is_safe(part):
+            return "mutating"
+    return "safe"
 
 
 def classify(tool: str, arguments: dict[str, Any]) -> tuple[str, str]:
@@ -165,7 +204,12 @@ class ApprovalPolicy:
     def _key(tool: str, arguments: dict[str, Any]) -> str:
         if tool == "run_command":
             command = str(arguments.get("command", "")).strip()
-            return f"run_command::{' '.join(command.split()).lower()}"
+            # Preserve case for correctness on case sensitive systems;
+            # only normalize whitespace.
+            return f"run_command::{' '.join(command.split())}"
         if tool in ("write_file", "edit_file"):
-            return f"{tool}::{str(arguments.get('path', '')).lower()}"
+            # Preserve case; normalize separators to forward slash.
+            raw = str(arguments.get("path", "")).strip()
+            normalized = raw.replace("\\", "/")
+            return f"{tool}::{normalized}"
         return tool

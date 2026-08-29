@@ -10,6 +10,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+# Required only to read the alternative configuration format.
+yaml = ["PyYAML>=6.0"]
+
 [project.scripts]
 mantra = "mantra.console:main"
 mantra-headless = "mantra.main:main"

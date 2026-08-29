@@ -57,6 +57,7 @@ from mantra.core.settings import (
     set_active,
     set_models,
     set_skills_prefs,
+    last_error,
     settings_path,
     skills_prefs,
     validate_endpoint,
@@ -71,7 +72,7 @@ from mantra.implementations.evaluators.null_evaluator import NullEvaluator
 from mantra.implementations.loggers.jsonl_logger import JsonlLogger
 from mantra.implementations.sandbox.local_sandbox import LocalSandbox
 from mantra.line_editor import Completion, LineEditor
-import mantra.compact as compact
+import mantra.tui as tui
 from mantra.registry import build_llm, build_tools
 
 # Local helpers (container/dashboard removed — compact is sole TUI)
@@ -113,6 +114,7 @@ HELP_TEXT = """Commands:
                         sent with every turn, so the agent keeps aiming
                         at it. /goal note <text>, /goal done
   /skills [name]        skills found in your skills directories.
+                        /skills refresh re-reads them after an edit ·
                         /skills find <text> · /skills use <name> ·
                         /skills bundles · /skills launch <bundle> ·
                         /skills auto [on|off] attaches a skill that
@@ -507,6 +509,28 @@ def _short_endpoint(base_url: str) -> str:
     return url.rstrip("/").removesuffix("/v1")
 
 
+def _read_text(path: str) -> str:
+    """Whole file as text, or an empty string when it cannot be read."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def _count_known_failures(path: str) -> int:
+    """Numbered entries in the failure registry."""
+    count = 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if line.startswith("## KF-") and line[6:7].isdigit():
+                    count += 1
+    except OSError:
+        return 0
+    return count
+
+
 def _transcript(messages: list[dict[str, Any]]) -> str:
     """Flatten history to plain text for the summariser."""
     lines = []
@@ -559,13 +583,15 @@ class ConsoleSession:
             max_messages=int(ctx_cfg.get("max_messages", 200)),
             max_chars=int(ctx_cfg.get("max_chars", 240_000)),
         )
-        self.system_prompt = assemble_system_prompt(
-            config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT,
-            known_failures_path=KNOWN_FAILURES_PATH,
-            memory_path=self.memory_path,
-            instructions_path=self.instructions_path,
-            environment=render_environment(workspace),
-        )
+        # The environment block costs up to three version-control
+        # processes, so it is deferred until the facts are actually
+        # needed rather than paid for before the first keystroke.
+        self._workspace = workspace
+        self._base_prompt = config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+        self._system_prompt_cache: str | None = None
+        # Summarised repository state for the header. Refreshed once per
+        # turn rather than on every redraw, because it costs a process.
+        self._git_state_cache: str | None = None
         self.tools = build_tools(config["tools"])
         self.llm = llm if llm is not None else build_llm(config["llm"])
         self.approvals = ApprovalPolicy(
@@ -632,21 +658,10 @@ class ConsoleSession:
         self._prompt_sent_at: float = 0.0
         # Streaming markdown renderer for inline formatting during token streaming.
         self._stream_renderer = StreamingRenderer(self.style)
-        # Compact layout only — no Frame, no dashboard
-        self.frame = None  # kept for compat, always None in compact
-        self.layout: compact.CompactLayout | None = None
-        self._compact = True  # compact is now sole TUI
+        self.layout: tui.Layout | None = None
         self._splash_visible = True
         self._abort = threading.Event()
         self._prev_sigint = None
-
-    # ---- frame compat (no-ops — compact has no Frame) --------------
-
-    def open_frame(self) -> bool:
-        return False
-
-    def close_frame(self, label: str = "") -> None:
-        pass
 
     def _sign_off(self) -> str:
         totals = self.totals
@@ -668,13 +683,44 @@ class ConsoleSession:
             return f"\033[{row};1H\033[2K{body}"
         return body
 
-    def close_prompt(self, column: int) -> None:
-        pass
+    @property
+    def git_state(self) -> str:
+        """Branch and working-tree state, as one short phrase.
 
-    def _frame_title(self) -> str:
-        return ""
-    def refresh_title(self) -> None:
-        return
+        Cached: the header is redrawn on resize and on request, and each
+        probe is a child process.
+        """
+        if self._git_state_cache is None:
+            self._git_state_cache = self._compute_git_state()
+        return self._git_state_cache
+
+    def _compute_git_state(self) -> str:
+        branch = self._git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        if not branch:
+            return "no git"
+        dirty = self._git("status", "--porcelain").strip()
+        if not dirty:
+            return branch
+        return f"{branch} · {len(dirty.splitlines())} modified"
+
+    @property
+    def system_prompt(self) -> str:
+        """The assembled base prompt, built the first time it is needed.
+
+        Deferred because assembling it probes the workspace's version
+        control state, which costs several child processes. Paying that
+        during construction delayed the first prompt for no benefit to
+        anyone who never sends a message.
+        """
+        if self._system_prompt_cache is None:
+            self._system_prompt_cache = assemble_system_prompt(
+                self._base_prompt,
+                known_failures_path=KNOWN_FAILURES_PATH,
+                memory_path=self.memory_path,
+                instructions_path=self.instructions_path,
+                environment=render_environment(self._workspace),
+            )
+        return self._system_prompt_cache
 
     def _isolate_git(self, workspace: str) -> None:
         """Give the workspace its own git repo if it does not have one."""
@@ -724,21 +770,6 @@ class ConsoleSession:
     def _note(self, text: str) -> None:
         self._print(f"  {self.style.dim(text)}")
 
-    def fresh_line(self) -> None:
-        """End the row the operator is on and start a clean one.
-
-        The prompt and the secret reader own their own line, so a frame
-        row is left open underneath the caret when they finish. Anything
-        the app draws next - the dashboard, a menu, a new reply - has to
-        start below that line, not beside it. Starting on the open row
-        would glue a ``│`` onto the prompt and push every later row a
-        column past the border.
-        """
-        out = sys.stdout
-        out.write("\n")
-        out.flush()
-
-
     def _on_event(self, name: str, payload: dict) -> None:
         if name == "tool_call":
             step = payload.get("step")
@@ -757,13 +788,18 @@ class ConsoleSession:
                     # Truncate long commands.
                     detail = f" {self.style.dim(cmd[:60])}{'…' if len(cmd) > 60 else ''}"
             self._print(f"  {self.style.dim(f'· step {step}')} {self.style.yellow(tool)}{detail}")
+        elif name == "tool_result":
+            # Tracked so the frame can show what the agent last did
+            # without re-reading the event log.
+            self.recent_tools.append(str(payload.get("tool", "")))
+            del self.recent_tools[:-5]
+            if self.verbose:
+                detail = self.style.dim("ok" if payload.get("ok") else "failed")
+                self._print(f"    {detail} {payload.get('seconds')}s")
         elif name == "tool_denied":
             self._print(f"  {self.style.red('✗ denied')} {self.style.dim(payload.get('tool',''))}")
         elif name == "run_error":
             self._print(f"  {self.style.red('!! ' + str(payload.get('error')))}")
-        elif name == "tool_result" and self.verbose:
-            detail = self.style.dim("ok" if payload.get("ok") else "failed")
-            self._print(f"    {detail} {payload.get('seconds')}s")
 
     def _on_delta(self, piece: str) -> None:
         """Streamed content fragment from the LLM client."""
@@ -824,20 +860,9 @@ class ConsoleSession:
         self._print(f"  {self.style.yellow('allow?')} {prompt}")
         self._print(self.style.dim("  [y]es   [n]o   [a]lways for this session"))
         try:
-            if self.frame is not None:
-                # Leave the caret on an open row so the answer is typed
-                # inside the frame rather than beside it.
-                self.frame.prompt("  allow> ")
-                answer = input().strip().lower()
-            else:
-                answer = input("  allow> ").strip().lower()
+            answer = input("  allow> ").strip().lower()
         except (KeyboardInterrupt, EOFError):
             return "n"
-        finally:
-            if self.frame is not None:
-                # input() consumed the newline, so the row it was typed on
-                # is already gone and cannot be closed - only forgotten.
-                self.frame.abandon_row()
         if answer in ("a", "always"):
             return "a"
         if answer in ("y", "yes"):
@@ -918,6 +943,19 @@ class ConsoleSession:
 
     @staticmethod
     def _render_file(rel: str, full: str) -> str:
+        # Detect binary files by sampling raw bytes before decoding
+        try:
+            with open(full, "rb") as handle:
+                sample = handle.read(8192)
+                if b"\x00" in sample:
+                    return f"--- @{rel} ---\n[binary file, not shown]"
+                # Heuristic: high proportion of non text bytes
+                if sample:
+                    non_text = sum(1 for b in sample if b < 9 or (13 < b < 32 and b != 10) or b > 126)
+                    if non_text / len(sample) > 0.3:
+                        return f"--- @{rel} ---\n[binary file, not shown]"
+        except OSError:
+            return ""
         try:
             with open(full, "r", encoding="utf-8", errors="replace") as handle:
                 content = handle.read(MAX_ATTACH_CHARS + 1)
@@ -1121,6 +1159,8 @@ class ConsoleSession:
             self._splash_visible = False
         self.message_count += 1
         self._abort.clear()
+        # The header summarises the repository; a turn may have changed it.
+        self._git_state_cache = None
         text, attached = self.expand_mentions(text)
         if attached:
             shown = attached[:8]
@@ -1136,6 +1176,15 @@ class ConsoleSession:
 
         self._auto_compact()
 
+        # Ensure the pinned system message reflects the current goal and
+        # attached skills. The orchestration loop only seeds the system
+        # prompt when the conversation is empty, so for long running
+        # sessions we must keep the first message up to date here.
+        effective_prompt = self._effective_system_prompt()
+        if self.context.messages and self.context.messages[0].get("role") == "system":
+            if self.context.messages[0].get("content") != effective_prompt:
+                self.context.messages[0]["content"] = effective_prompt
+                self.context.resync()
         loop = AgentLoop(
             llm=self.llm,
             sandbox=self.sandbox,
@@ -1143,7 +1192,7 @@ class ConsoleSession:
             evaluator=NullEvaluator(),
             logger=self.logger,
             events=self.bus,
-            system_prompt=self._effective_system_prompt(),
+            system_prompt=effective_prompt,
             max_steps=self.max_steps,
             on_delta=self._on_delta,
             context=self.context,
@@ -1159,7 +1208,6 @@ class ConsoleSession:
         self._turn_started = time.monotonic()
         self._spinner = Spinner(
             self.style,
-            frame=self.frame.frame if self.frame else None,
             layout=self.layout,
         ).start() if sys.stdout.isatty() else None
         result = None
@@ -1177,31 +1225,18 @@ class ConsoleSession:
             if self._streamed_this_run:
                 tail = self._stream_renderer.flush()
                 if tail:
-                    if self.layout is not None and self.layout.active:
-                        sys.stdout.write(tail)
-                        sys.stdout.flush()
-                    elif self.frame is not None:
-                        self.frame.write(tail)
-                        self.frame.flush()
-                    else:
-                        sys.stdout.write(tail)
-                        sys.stdout.flush()
+                    sys.stdout.write(tail)
+                    sys.stdout.flush()
                 # Streamed in full, so the reply is already on screen - do
                 # not print it again. A second copy would sit below the
                 # first, and because the streaming path emits raw text
                 # while render_markdown would strip its marks, the two
                 # would disagree with each other line for line.
-                if self.frame is None:
-                    sys.stdout.write("\n")  # close the streamed reply line
-                    sys.stdout.flush()
+                sys.stdout.write("\n")  # close the streamed reply line
+                sys.stdout.flush()
             elif result is not None and result.final_message:
                 body = render_markdown(result.final_message, self.style)
-                if self.frame is not None:
-                    # Delivered whole, so it can be word-wrapped properly
-                    # instead of streamed a word at a time.
-                    self.frame.row(body)
-                else:
-                    self._print(f"{self.style.bold('agent')} {body}")
+                self._print(f"{self.style.bold('agent')} {body}")
             if result is not None:
                 self._record_usage(result)
                 self._record_memory(task, result)
@@ -1234,12 +1269,6 @@ class ConsoleSession:
         """
         # Clear the live token counter so the next prompt is clean.
         self._stream_tokens = 0
-        if self.frame is not None:
-            if result is None:
-                self.frame.divider("no result")
-            else:
-                self.frame.divider(self._footer(result))
-            return
         if result is not None:
             self._print(f"  {self.style.dim(self._usage_line(result))}")
 
@@ -1305,11 +1334,14 @@ class ConsoleSession:
 
     def _record_memory(self, task: dict, result: RunResult) -> None:
         final = (result.final_message or "").strip().replace("\n", " ")[:300]
-        append_memory(
+        if not append_memory(
             self.memory_path,
             f"- {time.strftime('%Y-%m-%d %H:%M')} | {task['task_id']} | "
             f"{result.stopped_reason}: {final}",
-        )
+        ):
+            # Silent failure meant the durable record quietly stopped
+            # growing while everything looked normal.
+            self._note("could not write workspace memory")
 
     def _report_changes(self) -> None:
         """Announce files the agent touched, newest first, once each."""
@@ -1377,15 +1409,61 @@ class ConsoleSession:
             "model": self.config.get("llm", {}).get("model", "?"),
             "totals": self.totals,
             "messages": self.context.messages,
+            "goal": self.goal,
+            "goal_notes": self.goal_notes,
+            "active_skills": self.active_skills,
         }
+        # Atomic write to avoid corruption on interruption
+        tmp_path = path + ".tmp"
         try:
-            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            with open(tmp_path, "w", encoding="utf-8", newline="\n") as handle:
                 json.dump(payload, handle, ensure_ascii=False, indent=2)
+            try:
+                os.replace(tmp_path, path)
+            except OSError:
+                # Fallback on platforms where replace fails
+                os.remove(path) if os.path.exists(path) else None
+                os.rename(tmp_path, path)
         except OSError as exc:
             self._print(self.style.red(f"  save failed: {exc}"))
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
             return False
+        self._restrict(path)
         self._print(self.style.dim(f"  saved {len(self.context.messages)} messages to {path}"))
         return True
+
+    def _restore_totals(self, stored: object) -> None:
+        """Adopt saved counters, ignoring anything that is not a number.
+
+        A transcript is hand-editable, and a non-numeric value used to
+        raise on load and lose the whole session.
+        """
+        if not isinstance(stored, dict):
+            return
+        for key in self.totals:
+            value = stored.get(key)
+            try:
+                self.totals[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+
+    @staticmethod
+    def _restrict(path: str) -> None:
+        """Best effort at owner-only access.
+
+        A transcript carries whatever the conversation touched - file
+        contents, command output, sometimes credentials. The automatic
+        save path restricts it; this keeps the explicit one from being
+        the weaker of the two.
+        """
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
     def load_session(self, path: str) -> bool:
         try:
@@ -1400,9 +1478,22 @@ class ConsoleSession:
             return False
         self.context.messages = list(messages)
         self.context.resync()
-        totals = payload.get("totals")
-        if isinstance(totals, dict):
-            self.totals.update({k: int(v) for k, v in totals.items() if k in self.totals})
+        self._restore_totals(payload.get("totals"))
+        # Restore goal and skill state for consistency with autosave
+        self.goal = str(payload.get("goal") or "")
+        notes = payload.get("goal_notes")
+        self.goal_notes = [str(n) for n in notes] if isinstance(notes, list) else []
+        skills = payload.get("active_skills")
+        if isinstance(skills, list):
+            self.active_skills = [str(s).lower() for s in skills if str(s).strip()]
+        # Keep system message in sync with restored goal/skills
+        try:
+            effective = self._effective_system_prompt()
+            if self.context.messages and self.context.messages[0].get("role") == "system":
+                self.context.messages[0]["content"] = effective
+                self.context.resync()
+        except Exception:
+            pass
         self._print(
             self.style.dim(f"  restored {len(messages)} messages (~{self.context.tokens} tokens)")
         )
@@ -1425,7 +1516,7 @@ class ConsoleSession:
             return
         if not self.session_name:
             self.session_name = sessions.derive_name(self.workspace, self.model_name())
-        sessions.save(
+        saved = sessions.save(
             self.session_name,
             {
                 "workspace": self.workspace,
@@ -1434,9 +1525,12 @@ class ConsoleSession:
                 "totals": self.totals,
                 "goal": self.goal,
                 "goal_notes": self.goal_notes,
+                "active_skills": self.active_skills,
                 "messages": self.context.messages,
             },
         )
+        if saved is None:
+            self._note("could not save the session - /save writes it elsewhere")
 
     def model_name(self) -> str:
         return str(self.config.get("llm", {}).get("model", "") or "")
@@ -1467,9 +1561,7 @@ class ConsoleSession:
             return False
         self.context.messages = list(messages)
         self.context.resync()
-        totals = data.get("totals")
-        if isinstance(totals, dict):
-            self.totals.update({k: int(v) for k, v in totals.items() if k in self.totals})
+        self._restore_totals(data.get("totals"))
         self.message_count = sum(
             1 for m in messages if isinstance(m, dict) and m.get("role") == "user"
         )
@@ -1479,6 +1571,16 @@ class ConsoleSession:
         self.goal = str(data.get("goal") or "")
         notes = data.get("goal_notes")
         self.goal_notes = [str(n) for n in notes] if isinstance(notes, list) else []
+        skills = data.get("active_skills")
+        self.active_skills = [str(s).lower() for s in skills] if isinstance(skills, list) else []
+        # Keep system message in sync with restored state
+        try:
+            effective = self._effective_system_prompt()
+            if self.context.messages and self.context.messages[0].get("role") == "system":
+                self.context.messages[0]["content"] = effective
+                self.context.resync()
+        except Exception:
+            pass
         # Adopt the name, so the next autosave continues this session
         # rather than starting a second file beside it.
         self.session_name = name
@@ -1665,19 +1767,21 @@ class ConsoleSession:
                 )
 
     def show_dashboard(self) -> bool:
-        """In compact mode, dashboard is the startup card (once)."""
+        """Redraw the frame: header, rules, status and the startup card."""
         if not sys.stdout.isatty():
             return False
         try:
-            compact.show_splash(self, self.style)
+            if self.layout is not None and self.layout.active:
+                self.layout.draw_chrome()
+                self.layout.show_splash()
             return True
         except Exception:
             return False
 
     def show_dashboard_counted(self) -> int:
-        """Compact: just the startup card height."""
+        """How many rows the startup card occupies."""
         try:
-            return len(compact.render_card(self, enabled=getattr(self.style, "enabled", True)))
+            return len(tui.render_card(self, self.style))
         except Exception:
             return 5
 
@@ -1690,7 +1794,6 @@ class ConsoleSession:
             return
         if not quiet:
             self._print(self.style.dim(f"  model is now {name}"))
-        self.refresh_title()
         self._warn_if_key_missing()
 
     def set_reasoning(self, level: str, quiet: bool = False) -> None:
@@ -1718,7 +1821,6 @@ class ConsoleSession:
             self._print(
                 self.style.dim(f"  reasoning is now {wanted}" if wanted else "  reasoning off")
             )
-        self.refresh_title()
 
     def show_reasoning(self) -> None:
         effort = self.config.get("llm", {}).get("reasoning_effort")
@@ -1760,7 +1862,6 @@ class ConsoleSession:
             return False
         set_active(endpoint=name.lower(), model=llm.get("model", ""))
         self._print(self.style.dim(f"  endpoint is now {entry['base_url']}"))
-        self.refresh_title()
         self._warn_if_key_missing()
         return True
 
@@ -1841,10 +1942,7 @@ class ConsoleSession:
             self._print(s.dim(f"instructions loaded from {os.path.basename(self.instructions_path)}"))
         if os.path.isfile(KNOWN_FAILURES_PATH):
             # Skip the "## KF-N" template line: only numbered entries count.
-            count = sum(
-                1 for ln in open(KNOWN_FAILURES_PATH, encoding="utf-8", errors="replace")
-                if ln.startswith("## KF-") and ln[6:7].isdigit()
-            )
+            count = _count_known_failures(KNOWN_FAILURES_PATH)
             self._print(s.dim(f"known-failure registry: {count} classes"))
         self._print(s.dim("type /help for commands"))
 
@@ -1853,16 +1951,26 @@ class ConsoleSession:
 # in the user's own settings file, which is hand-editable and is
 # written by /connect. See core/settings.py for the shape.
 
-# Endpoints reached over localhost that accept any key or none at all.
-KEYLESS_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0")
+# Endpoints reached over loopback that accept any key or none at all.
+KEYLESS_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})
 
 
 def provider_needs_key(base_url: str, api_key_env: str) -> bool:
-    """False for local endpoints, which simply do not check a key."""
+    """False for local endpoints, which simply do not check a key.
+
+    Compared against the parsed host rather than the whole URL: a
+    substring search over the URL decided that a public host whose name
+    happened to contain one of these markers needed no credential, and
+    the request then failed with an authentication error that pointed
+    nowhere near the actual cause.
+    """
     if not api_key_env:
         return False
-    lowered = (base_url or "").lower()
-    return not any(host in lowered for host in KEYLESS_HOSTS)
+    try:
+        host = (urlparse(base_url or "").hostname or "").lower()
+    except ValueError:
+        return True
+    return host not in KEYLESS_HOSTS
 
 
 SLASH_COMMANDS = [
@@ -2048,7 +2156,7 @@ class ConsoleCompleter:
         parts = prefix.strip().split()
         if not parts or parts[0] != "/skills":
             return None
-        subcommands = ["list", "show", "use", "apply", "find", "search", "route", "bundles", "bundle", "launch", "run", "auto", "clear", "off", "drop", "on"]
+        subcommands = ["list", "show", "use", "apply", "find", "search", "route", "bundles", "bundle", "launch", "run", "auto", "clear", "off", "drop", "on", "refresh", "reload"]
         skill_names = [s.name for s in skills.list_skills()]
         bundle_names = list(skills.load_bundles().keys())
         if len(parts) == 1:
@@ -2202,7 +2310,6 @@ def _read_choice(session: "ConsoleSession", prompt_text: str) -> str:
             session.style,
             completer=None,
             hint="",
-            on_submit=session.close_prompt,
         )
         return editor.read(session.prompt_text(prompt_text)).strip()
     except (KeyboardInterrupt, EOFError):
@@ -2237,6 +2344,10 @@ def _skills(session: "ConsoleSession", argument: str) -> None:
         _skills_find(session, rest)
     elif head == "auto":
         _skills_auto(session, rest)
+    elif head in ("refresh", "reload", "rescan"):
+        skills.invalidate_cache()
+        session._print(session.style.dim("  skills re-indexed"))
+        _skills_list(session)
     elif head in ("clear", "off", "drop"):
         if session.active_skills:
             session._print(session.style.dim("  skills detached: " + ", ".join(session.active_skills)))
@@ -2714,7 +2825,6 @@ def _menu(
         cursor=cursor,
         # Menus are drawn as frame rows when the session is framed, so
         # a list never hangs off the side of the box.
-        frame=session.frame,
     )
     # The menu returns "" for an explicit cancel and None when there is
     # no terminal; both mean "leave things as they are".
@@ -3045,7 +3155,6 @@ def _connect_new(session: "ConsoleSession", url: str = "", key: str = "") -> boo
     picked = _choose_model(session)
     # After the model menu: the header now names both the new endpoint
     # and the model the operator just chose.
-    session.refresh_title()
     return picked
 
 
@@ -3174,7 +3283,7 @@ def _ask_secret(session: "ConsoleSession", label: str) -> str:
     prompt carries the frame's left border, and the row is closed with
     the same column count the editor uses.
     """
-    return _read_secret(session.prompt_text(label), closer=session.close_prompt)
+    return _read_secret(session.prompt_text(label))
 
 
 def _derive_name(url: str) -> str:
@@ -3235,7 +3344,7 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
     elif command == "/memory":
         mem = session.memory_path
         session._print(f"memory file: {mem}")
-        session._print(open(mem, encoding="utf-8", errors="replace").read() if os.path.isfile(mem) else "(empty)")
+        session._print(_read_text(mem) or "(empty)")
     elif command == "/diff":
         session.show_diff()
     elif command == "/undo":
@@ -3372,7 +3481,10 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
             except ValueError:
                 session._print("usage: /steps <number>")
         else:
-            session._print(session.max_steps)
+            # _print concatenates its argument with a newline and the
+            # limit is an int, so this raised on the bare form of the
+            # command - the one the help text advertises first.
+            session._print(str(session.max_steps))
     elif command == "/verbose":
         session.verbose = not session.verbose
         session._print(f"verbose {'on' if session.verbose else 'off'}")
@@ -3441,6 +3553,14 @@ def main(argv: list[str] | None = None) -> int:
     workspace = args.workspace or _infer_workspace()
     session = ConsoleSession(config, workspace, style)
 
+    # A file that could not be parsed reads as empty, which is
+    # indistinguishable from having no endpoints. Say so, or the operator
+    # concludes they have to re-enter everything.
+    problem = last_error()
+    if problem:
+        session._print(style.yellow("  warning: " + problem))
+        session._print(style.dim("  the file has been copied aside; nothing was lost"))
+
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     needs_setup = interactive and _needs_first_run(session)
 
@@ -3467,16 +3587,14 @@ def main(argv: list[str] | None = None) -> int:
         else:
             sys.stdout.write("\033[2J\033[3J\033[H")
         sys.stdout.flush()
-        session._compact = True
+        # Build the frame before anything prints, so the key warning and
+        # the startup card land inside the content region rather than
+        # over the chrome.
+        session.layout = tui.Layout()
+        framed = session.layout.setup(session, style)
         session._warn_if_key_missing()
-        splash_rows = compact.show_splash(session, style)
-        layout = compact.CompactLayout()
-        layout.setup(splash_rows, session, style)
-        session.layout = layout
-        try:
-            compact.draw_status(session, style)
-        except Exception:
-            pass
+        if framed:
+            session.layout.show_splash()
         sys.stdout.write(session.prompt_text())
         sys.stdout.flush()
     else:
@@ -3488,7 +3606,6 @@ def main(argv: list[str] | None = None) -> int:
         # typing at a prompt with no bottom edge.
         if session.layout is not None and session.layout.active:
             session.layout.cleanup()
-        session.close_frame()
     return 0
 
 
@@ -3500,29 +3617,21 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
         # In bottom-fixed mode, disable the popup (it would scroll
         # off-screen) and skip the trailing newline (the layout
         # manages cursor positioning).
-        is_compact = bool(getattr(session, "_compact", False))
         def _ctrl_g_handler() -> None:
-            if is_compact and fixed_bottom and session.layout is not None:
-                session.layout.move_to_dashboard()
+            if fixed_bottom and session.layout is not None:
+                session.layout.move_to_header()
                 try:
-                    compact.show_splash(session, style)
-                    compact.draw_status(session, style)
+                    session.show_dashboard()
                 except Exception:
                     pass
                 session.layout.move_to_prompt()
             elif fixed_bottom and session.layout is not None:
-                # Redraw dashboard at the top, then reposition at prompt.
-                session.layout.move_to_dashboard()
+                # Redraw the frame at the top, then reposition at prompt.
+                session.layout.move_to_header()
                 session.show_dashboard()
                 session.layout.move_to_prompt()
             else:
-                if is_compact:
-                    try:
-                        compact.show_splash(session, style)
-                    except Exception:
-                        pass
-                else:
-                    session.show_dashboard()
+                session.show_dashboard()
 
         def _restore_region() -> None:
             """Restore the DECSTBM scroll region after a scroll."""
@@ -3554,7 +3663,6 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
             no_popup=False,
             popup_above=fixed_bottom,
             on_ctrl_g=_ctrl_g_handler,
-            on_submit=session.close_prompt if not fixed_bottom else None,
             on_page_up=_page_up if fixed_bottom else None,
             on_page_down=_page_down if fixed_bottom else None,
         )
@@ -3572,13 +3680,9 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
                 # the bottom of the terminal.  Read input there, then
                 # move the cursor to the content area for output.
                 line = reader(session.prompt_text(), skip_newline=True).strip()
-            elif session.frame is not None:
-                # A blank row separates turns; the frame is what makes
-                # the separation visible, so no leading newline is
-                # needed the way the plain layout wants one.
-                session.frame.row("")
-                line = reader(session.prompt_text()).strip()
             else:
+                # A blank row separates turns, so the next reply does
+                # not start on the row the operator typed on.
                 line = reader(f"\n{session.prompt_text()}").strip()
         except (KeyboardInterrupt, EOFError):
             return
@@ -3598,11 +3702,10 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
                 session.handle(line)
             # After processing, redraw the prompt at the bottom.
             if fixed_bottom:
-                if bool(getattr(session, "_compact", False)):
-                    try:
-                        compact.draw_status(session, style)
-                    except Exception:
-                        pass
+                try:
+                    tui.draw_status(session, style)
+                except Exception:
+                    pass
                 sys.stdout.write(session.prompt_text())
                 sys.stdout.flush()
         except SystemExit:

@@ -37,6 +37,11 @@ class ContextManager:
     def __init__(self, max_messages: int = 200, max_chars: int = 240_000) -> None:
         if max_messages < 4:
             raise ValueError("max_messages must be at least 4")
+        if max_chars is not None and max_chars < 0:
+            raise ValueError("max_chars must be non negative")
+        # Zero disables the character budget; treat as unlimited
+        if not max_chars:
+            max_chars = 10**9
         self.max_messages = max_messages
         self.max_chars = max_chars
         self.messages: list[dict[str, Any]] = []

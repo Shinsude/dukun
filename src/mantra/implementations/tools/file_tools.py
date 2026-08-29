@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import os
+import re
+import shlex
 from typing import Any
 
 from mantra.interfaces.sandbox import Sandbox
 from mantra.interfaces.tool import Tool
+
+_SHELL_META_RE = re.compile(r"[;&|`$()<>]")
 
 _MAX_READ_CHARS = 20000
 
@@ -106,29 +110,39 @@ class ListDirTool(Tool):
     }
 
     def execute(self, sandbox: Sandbox, path: str) -> str:
+        # Basic validation to reduce injection risk for shell fallbacks
+        if "\x00" in path or "\n" in path or "\r" in path:
+            return "ERROR: invalid path"
         root = getattr(sandbox, "root", None)
         if root is None:
             # Sandboxes without a direct file view list via shell.
-            # Try portable listings for different environments.
+            # Validate against shell metacharacters and use safe quoting.
+            if _SHELL_META_RE.search(path) or '"' in path or "'" in path:
+                return "ERROR: path contains unsupported characters for shell listing"
+            quoted = shlex.quote(path)
             for cmd in (
-                f'ls -la "{path}"',
-                f'ls -1 "{path}"',
-                f'dir "{path}"',
-                f'python -c "import os,sys; p=sys.argv[1]; print(chr(10).join(sorted(os.listdir(p))))" "{path}"',
+                f"ls -la {quoted}",
+                f"ls -1 {quoted}",
+                f"python -c \"import os,sys; p=sys.argv[1]; print(chr(10).join(sorted(os.listdir(p))))\" {quoted}",
             ):
                 result = sandbox.exec(cmd)
                 if result.exit_code == 0 and result.stdout.strip():
                     return result.stdout
             return result.stdout if result.exit_code == 0 else f"ERROR: {result.stderr or 'listing failed'}"
 
+        # Direct file view: resolve and ensure confinement
         base = root if path in (".", "") else os.path.join(root, path)
         try:
-            entries = sorted(os.listdir(base))
+            real_base = os.path.realpath(base)
+            real_root = os.path.realpath(root)
+            if not (real_base == real_root or real_base.startswith(real_root + os.sep)):
+                return f"ERROR: path escapes workspace: {path}"
+            entries = sorted(os.listdir(real_base))
         except OSError as exc:
             return f"ERROR: {exc}"
         lines = []
         for entry in entries:
-            full = os.path.join(base, entry)
+            full = os.path.join(real_base, entry)
             marker = "/" if os.path.isdir(full) else ""
             lines.append(entry + marker)
         return "\n".join(lines) or "(empty directory)"

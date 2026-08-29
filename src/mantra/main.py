@@ -19,7 +19,11 @@ from mantra.config import load_config
 from mantra.core.agent_loop import DEFAULT_SYSTEM_PROMPT, AgentLoop
 from mantra.core.events import EventBus
 from mantra.core.exceptions import ConfigError
-from mantra.core.knowledge import assemble_system_prompt
+from mantra.core.knowledge import (
+    assemble_system_prompt,
+    find_instructions_file,
+    render_environment,
+)
 from mantra.registry import build_evaluator, build_llm, build_logger, build_sandbox, build_tools
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -66,14 +70,25 @@ def main(argv: list[str] | None = None) -> int:
         print("error: task file must contain 'problem_statement'", file=sys.stderr)
         return 2
 
-    llm = build_llm(config["llm"])
-    sandbox = build_sandbox(config["sandbox"])
-    tools = build_tools(config["tools"])
-    evaluator = build_evaluator(config["evaluator"])
-    logger = build_logger(config["logging"])
+    # Component construction can fail on a bad provider or evaluator
+    # name, and a configuration fault should leave with the same status
+    # code as any other, not with a traceback.
+    try:
+        llm = build_llm(config["llm"])
+        sandbox = build_sandbox(config["sandbox"])
+        tools = build_tools(config["tools"])
+        evaluator = build_evaluator(config["evaluator"])
+        logger = build_logger(config["logging"])
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"error: could not start logging: {exc}", file=sys.stderr)
+        return 2
     events = EventBus()
     events.subscribe(lambda name, payload: print(f"[{name}] {_brief(payload)}"))
 
+    workspace = str(config.get("workspace") or os.getcwd())
     loop = AgentLoop(
         llm=llm,
         sandbox=sandbox,
@@ -81,9 +96,15 @@ def main(argv: list[str] | None = None) -> int:
         evaluator=evaluator,
         logger=logger,
         events=events,
+        # The same assembly the console uses. Supplying only the
+        # failure registry left the graded run with a materially weaker
+        # standing prompt than the interactive one on the same workspace.
         system_prompt=assemble_system_prompt(
             config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT,
             known_failures_path=os.path.join(PROJECT_ROOT, "knowledge", "known-failures.md"),
+            memory_path=os.path.join(workspace, ".mantra", "memory.md"),
+            instructions_path=find_instructions_file(workspace),
+            environment=render_environment(workspace),
         ),
         max_steps=config.get("max_steps", 30),
     )
