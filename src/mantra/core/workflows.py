@@ -1,0 +1,165 @@
+"""Named sequences of prompts, run in order.
+
+A workflow is a list of steps. Launching one sends each step to the
+agent in turn, so a job that always takes the same shape - read the
+diff, run the tests, summarise what broke - can be fired once instead
+of typed three times.
+
+They live in one hand-editable file, ``~/.mantra/workflows.json``::
+
+    {
+      "version": 1,
+      "workflows": {
+        "ship": {
+          "name": "ship",
+          "created_at": "2026-08-29 08:12:44",
+          "steps": ["read the diff", "run the tests", "fix any failures"]
+        }
+      }
+    }
+
+Nothing interprets a step: it is handed to the agent verbatim, so a
+step can be an instruction, a question, or a file mention.
+
+``MANTRA_WORKFLOWS`` redirects the file for tests.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any
+
+_VERSION = 1
+_OVERRIDE_ENV = "MANTRA_WORKFLOWS"
+
+_MAX_STEPS = 50
+_MAX_STEP_CHARS = 4000
+
+
+def workflows_path() -> Path:
+    """Where workflows live. Honours MANTRA_WORKFLOWS for tests."""
+    override = os.environ.get(_OVERRIDE_ENV)
+    if override:
+        return Path(override)
+    return Path.home() / ".mantra" / "workflows.json"
+
+
+def slug(name: str) -> str:
+    """A name safe to type and to use as a filename.
+
+    Spaces are collapsed rather than rejected, so `/workflow create my
+    flow` produces `my-flow` instead of an error - and `/workflow launch
+    my flow` finds it again.
+    """
+    return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+
+
+def _empty() -> dict[str, Any]:
+    return {"version": _VERSION, "workflows": {}}
+
+
+def load_all() -> dict[str, Any]:
+    """The whole file. A missing or corrupt file reads as empty.
+
+    Corrupt is deliberately not an exception here: a hand-edited file
+    with a stray comma should cost the operator their last edit, not
+    every workflow they have.
+    """
+    target = workflows_path()
+    if not target.is_file():
+        return _empty()
+    try:
+        with open(target, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return _empty()
+    if not isinstance(data, dict) or not isinstance(data.get("workflows"), dict):
+        return _empty()
+    return data
+
+
+def _save_all(data: dict[str, Any]) -> bool:
+    target = workflows_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+    except OSError:
+        return False
+    return True
+
+
+def get(name: str) -> dict[str, Any] | None:
+    """One workflow by name, or None."""
+    found = load_all()["workflows"].get(slug(name))
+    if not isinstance(found, dict):
+        return None
+    steps = found.get("steps")
+    if not isinstance(steps, list):
+        return None
+    return found
+
+
+def list_workflows() -> list[dict[str, Any]]:
+    """Every workflow, alphabetically, with its step count."""
+    out = []
+    for key, value in load_all()["workflows"].items():
+        if not isinstance(value, dict):
+            continue
+        steps = value.get("steps")
+        # Skipped unless it really has steps, matching get(): an entry
+        # that cannot be shown or launched must not be listed, or the
+        # operator picks it from the list and is told it does not exist.
+        if not isinstance(steps, list) or not steps:
+            continue
+        out.append(
+            {
+                "name": value.get("name") or key,
+                "created_at": value.get("created_at") or "",
+                "steps": [str(step) for step in steps],
+            }
+        )
+    out.sort(key=lambda item: item["name"])
+    return out
+
+
+def create(name: str, steps: list[str]) -> tuple[bool, str]:
+    """Add or replace a workflow. Returns (ok, message)."""
+    key = slug(name)
+    if not key:
+        return False, "a workflow needs a name"
+    clean = [str(step).strip() for step in steps if str(step).strip()]
+    if not clean:
+        return False, "a workflow needs at least one step"
+    if len(clean) > _MAX_STEPS:
+        return False, f"too many steps (limit {_MAX_STEPS})"
+    too_long = [step for step in clean if len(step) > _MAX_STEP_CHARS]
+    if too_long:
+        return False, f"a step is longer than {_MAX_STEP_CHARS} characters"
+
+    data = load_all()
+    existed = key in data["workflows"]
+    data["workflows"][key] = {
+        "name": key,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "steps": clean,
+    }
+    if not _save_all(data):
+        return False, "could not write the workflow file"
+    count = len(clean)
+    label = f"{count} step" if count == 1 else f"{count} steps"
+    verb = "updated" if existed else "created"
+    return True, f"{verb} '{key}' ({label})"
+
+
+def delete(name: str) -> bool:
+    key = slug(name)
+    data = load_all()
+    if key not in data["workflows"]:
+        return False
+    del data["workflows"][key]
+    return _save_all(data)

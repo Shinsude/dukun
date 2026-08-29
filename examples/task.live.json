@@ -1,0 +1,5 @@
+{
+  "task_id": "live-write-greeting",
+  "problem_statement": "Create a Python module named greet.py that defines a function greet() returning exactly 'hello' (lowercase). Then verify your work by running the test command.",
+  "test_cmd": "python -c \"from greet import greet; assert greet() == 'hello'; print('greet OK')\""
+}

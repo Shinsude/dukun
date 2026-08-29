@@ -1,0 +1,57 @@
+"""Scripted mock client for offline testing of the harness loop.
+
+Replays a fixed list of responses, validating that requested tool calls are
+well-formed. Lets the full pipeline be verified end to end without any API
+key or network access.
+"""
+
+from __future__ import annotations
+
+import types
+
+from mantra.core.exceptions import LLMError
+from mantra.interfaces.llm_client import LLMClient, LLMResponse, ToolCall
+
+
+class ScriptedLLMClient(LLMClient):
+    """Returns queued responses in order; raises when the script runs dry."""
+
+    def __init__(self, script: list[LLMResponse]) -> None:
+        self.script = list(script)
+        self.received_messages: list[list[dict]] = []
+
+    def chat(self, messages, tools=None, on_delta=None) -> LLMResponse:
+        self.received_messages.append(messages)
+        if not self.script:
+            raise LLMError("scripted LLM exhausted before the run finished")
+        return self.script.pop(0)
+
+
+def tool_call_response(name: str, arguments: dict) -> LLMResponse:
+    """Helper to build a one-tool-call response."""
+    return LLMResponse(
+        tool_calls=[ToolCall(id=f"call_{name}_{id(arguments) & 0xFFFF}", name=name, arguments=arguments)]
+    )
+
+
+def final_response(content: str, stream: bool = False) -> LLMResponse:
+    """A no-tool final answer.
+
+    ``stream=True`` is for console tests: it returns a ``ScriptedLLMClient``
+    that emits the reply word-by-word through ``on_delta`` before returning
+    the same response, so the streaming render path is exercised rather
+    than the whole-delivery path.
+    """
+    response = LLMResponse(content=content)
+    if not stream:
+        return response
+
+    def chat(self, messages, tools=None, on_delta=None):
+        if on_delta:
+            for word in content.split(" "):
+                on_delta(word + " ")
+        return response
+
+    client = ScriptedLLMClient([response])
+    client.chat = types.MethodType(chat, client)
+    return client

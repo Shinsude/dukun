@@ -1,0 +1,275 @@
+"""The user's own MANTRA settings: endpoints, models and the active pick.
+
+Everything here lives in one hand-editable file, ``~/.mantra/config.json``:
+
+    {
+      "version": 1,
+      "endpoints": {
+        "openai": {
+          "base_url": "https://api.openai.com/v1",
+          "api_key_env": "OPENAI_API_KEY",
+          "models": ["gpt-4o", "gpt-4o-mini"]
+        }
+      },
+      "active": {
+        "endpoint": "openai",
+        "model": "gpt-4o",
+        "reasoning_effort": null
+      }
+    }
+
+``/connect`` writes it, but nothing requires ``/connect``: edit the file
+by hand, add an endpoint or type a model into ``models``, and MANTRA
+picks it up on the next command. There are no built-in providers any
+more, so this file is the whole list.
+
+Keys are never stored here - only the *name* of the environment
+variable or credential-store entry the key lives in. Keys themselves
+stay in ``core/keys.py``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any, Iterable
+
+_VERSION = 1
+
+# Tests point this elsewhere; nobody else should need to.
+_OVERRIDE_ENV = "MANTRA_SETTINGS"
+
+DEFAULT_FILE = {
+    "version": _VERSION,
+    "endpoints": {},
+    "active": {"endpoint": "", "model": "", "reasoning_effort": None},
+    "skills": {
+        # Whether the router may attach a skill to a plain prompt. Kept
+        # here rather than in the config because it is a preference the
+        # operator switches once, and config.json is an input, not a
+        # scratchpad - nothing in MANTRA writes back to it.
+        "auto": True,
+        "auto_bundle": False,
+    },
+}
+
+
+def path() -> Path:
+    """Where the settings live. Honours MANTRA_SETTINGS for tests."""
+    return settings_path()
+
+
+def settings_path() -> Path:
+    """Public name for the file the user may edit by hand."""
+    override = os.environ.get(_OVERRIDE_ENV)
+    if override:
+        return Path(override)
+    return Path.home() / ".mantra" / "config.json"
+
+
+def _read() -> dict[str, Any]:
+    file = path()
+    if not file.is_file():
+        return {}
+    try:
+        data = json.loads(file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        # A file the user is editing by hand will be broken sometimes.
+        # Losing their settings silently is worse than starting empty,
+        # but crashing at startup is worst of all.
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write(data: dict[str, Any]) -> None:
+    file = path()
+    file.parent.mkdir(parents=True, exist_ok=True)
+    data["version"] = _VERSION
+    file.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def load() -> dict[str, Any]:
+    """The whole settings document, with the expected shape guaranteed."""
+    data = _read()
+    out = {
+        "version": _VERSION,
+        "endpoints": {},
+        "active": dict(DEFAULT_FILE["active"]),
+        "skills": dict(DEFAULT_FILE["skills"]),
+    }
+    skills = data.get("skills")
+    if isinstance(skills, dict):
+        out["skills"].update({key: skills.get(key, value) for key, value in DEFAULT_FILE["skills"].items()})
+    endpoints = data.get("endpoints")
+    if isinstance(endpoints, dict):
+        for name, entry in endpoints.items():
+            if isinstance(entry, dict) and entry.get("base_url"):
+                out["endpoints"][str(name)] = _clean_endpoint(entry)
+    active = data.get("active")
+    if isinstance(active, dict):
+        out["active"].update({k: active.get(k, v) for k, v in DEFAULT_FILE["active"].items()})
+    return out
+
+
+def _clean_endpoint(entry: dict[str, Any]) -> dict[str, Any]:
+    base_url = str(entry.get("base_url", "")).strip().rstrip("/")
+    return {
+        "base_url": base_url,
+        "api_key_env": str(entry.get("api_key_env", "")).strip(),
+        "models": [str(m) for m in entry.get("models") or [] if str(m).strip()],
+        "note": str(entry.get("note", "")).strip(),
+    }
+
+
+# ---- endpoints -----------------------------------------------------------
+
+
+def endpoints() -> dict[str, dict[str, Any]]:
+    return load()["endpoints"]
+
+
+def get_endpoint(name: str) -> dict[str, Any] | None:
+    return endpoints().get((name or "").strip().lower())
+
+
+def add_endpoint(
+    name: str,
+    base_url: str,
+    api_key_env: str = "",
+    models: Iterable[str] | None = None,
+    note: str = "",
+) -> None:
+    """Add or replace an endpoint. Raises ValueError on a bad entry."""
+    name = (name or "").strip().lower()
+    if not name:
+        raise ValueError("an endpoint needs a name")
+    url = (base_url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("base_url must start with http:// or https://")
+    data = load()
+    existing = data["endpoints"].get(name)
+    merged = _clean_endpoint(
+        {
+            "base_url": url,
+            "api_key_env": api_key_env or (existing or {}).get("api_key_env", ""),
+            # Hand-added models survive a re-connect: only replace the
+            # list when new ones were actually discovered (None means keep).
+            "models": list(models) if models is not None else (existing or {}).get("models", []),
+            "note": note or (existing or {}).get("note", ""),
+        }
+    )
+    data["endpoints"][name] = merged
+    _write(data)
+
+
+def remove_endpoint(name: str) -> bool:
+    data = load()
+    if name not in data["endpoints"]:
+        return False
+    del data["endpoints"][name]
+    if data["active"].get("endpoint") == name:
+        data["active"]["endpoint"] = ""
+        data["active"]["model"] = ""
+    _write(data)
+    return True
+
+
+def set_models(name: str, models: Iterable[str]) -> None:
+    """Record what an endpoint serves, so /model can list it offline."""
+    data = load()
+    entry = data["endpoints"].get(name)
+    if entry is None:
+        return
+    entry["models"] = [str(m) for m in models if str(m).strip()]
+    _write(data)
+
+
+def models_for(name: str) -> list[str]:
+    entry = get_endpoint(name)
+    return list(entry.get("models") or []) if entry else []
+
+
+def endpoint_name_for_url(base_url: str) -> str | None:
+    """Which endpoint name, if any, serves this base URL."""
+    wanted = (base_url or "").strip().rstrip("/").lower()
+    for name, entry in endpoints().items():
+        if entry.get("base_url", "").rstrip("/").lower() == wanted:
+            return name
+    return None
+
+
+class _Unset:
+    """Sentinel so ``set_active(effort=None)`` can mean "off".
+
+    Plain ``None`` cannot carry that meaning, because it is also the
+    value the sentinel has to be distinguishable from.
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<unset>"
+
+
+_UNSET = _Unset()
+
+
+# ---- the active pick -----------------------------------------------------
+
+
+def active() -> dict[str, Any]:
+    return load()["active"]
+
+
+def set_active(
+    endpoint: str | None = None,
+    model: str | None = None,
+    reasoning_effort: Any = _UNSET,
+) -> None:
+    """Record the current choice. Arguments left as-is when not given."""
+    data = load()
+    if endpoint is not None:
+        data["active"]["endpoint"] = endpoint
+    if model is not None:
+        data["active"]["model"] = model
+    if reasoning_effort is not _UNSET:
+        data["active"]["reasoning_effort"] = reasoning_effort
+    _write(data)
+
+
+def skills_prefs() -> dict[str, Any]:
+    """The skills preferences the operator has actually set.
+
+    Empty rather than defaulted when they have never touched them, so a
+    config.json that sets these is not silently overridden by defaults
+    that were merely assumed on their behalf.
+    """
+    stored = _read().get("skills")
+    if not isinstance(stored, dict):
+        return {}
+    return {
+        key: bool(stored[key])
+        for key in DEFAULT_FILE["skills"]
+        if key in stored
+    }
+
+
+def set_skills_prefs(auto: bool | None = None, auto_bundle: bool | None = None) -> None:
+    """Record the skills preferences. Arguments left as-is when not given."""
+    data = load()
+    if auto is not None:
+        data["skills"]["auto"] = bool(auto)
+    if auto_bundle is not None:
+        data["skills"]["auto_bundle"] = bool(auto_bundle)
+    _write(data)
+
+
+def validate_endpoint(entry: dict[str, Any]) -> str | None:
+    """An error message when an endpoint entry is unusable, else None."""
+    if not isinstance(entry, dict):
+        return "endpoint entry must be an object"
+    if not str(entry.get("base_url", "")).strip():
+        return "base_url is required"
+    url = str(entry["base_url"]).strip().lower()
+    if not url.startswith(("http://", "https://")):
+        return "base_url must start with http:// or https://"
+    return None

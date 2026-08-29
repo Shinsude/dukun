@@ -1,0 +1,28 @@
+# Generated / cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+
+# Runtime state
+logs/
+workspace/.mantra/
+workspace/__pycache__/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

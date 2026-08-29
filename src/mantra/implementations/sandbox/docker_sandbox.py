@@ -1,0 +1,251 @@
+"""Docker-isolated sandbox driven by the docker CLI.
+
+Uses ``docker run``/``docker exec``/``docker cp`` through subprocess so the
+harness has no Python Docker SDK dependency. Requires the docker CLI on PATH
+and a running daemon.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import tempfile
+import uuid
+
+from mantra.core.exceptions import AbortError, SandboxError
+from mantra.interfaces.sandbox import ExecResult, Sandbox
+
+_EXEC_TIMEOUT = 600.0
+
+
+class DockerSandbox(Sandbox):
+    """One disposable container per task run."""
+
+    def __init__(
+        self,
+        image: str = "python:3.11-slim",
+        mem_limit: str = "2g",
+        network_enabled_during_setup: bool = True,
+        workdir: str = "/workspace",
+    ) -> None:
+        self.image = image
+        self.mem_limit = mem_limit
+        self.network_enabled_during_setup = network_enabled_during_setup
+        self.workdir = workdir
+        self._container_id: str | None = None
+
+    def setup(self, task: dict) -> None:
+        self._container_id = f"mantra-{uuid.uuid4().hex[:12]}"
+        network = "--network none" if not self.network_enabled_during_setup else ""
+        if not self._run_cli(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                self._container_id,
+                "--memory",
+                self.mem_limit,
+                "--cpus",
+                "1.0",
+                "-w",
+                self.workdir,
+                *network.split(),
+                self.image,
+                "sleep",
+                "infinity",
+            ]
+        ):
+            raise SandboxError("docker run failed to start the container")
+
+        repo_url = task.get("repo_url")
+        if repo_url:
+            repo_str = str(repo_url)
+            if not self._is_safe_repo_url(repo_str):
+                raise SandboxError(f"repo_url rejected: {repo_str!r}")
+            result = self._exec_no_shell(
+                ["git", "clone", repo_str, "."], timeout=300
+            )
+            if result.exit_code != 0:
+                raise SandboxError(f"git clone failed: {result.stderr[:2000]}")
+            commit = task.get("base_commit")
+            if commit:
+                commit_str = str(commit)
+                if not self._is_safe_commit(commit_str):
+                    raise SandboxError(f"base_commit rejected: {commit_str!r}")
+                if self._exec_no_shell(
+                    ["git", "checkout", commit_str], timeout=60
+                ).exit_code != 0:
+                    raise SandboxError(f"git checkout failed for {commit_str}")
+
+        setup_cmd = task.get("setup_cmd")
+        if setup_cmd and self.exec(setup_cmd, timeout=600).exit_code != 0:
+            raise SandboxError(f"setup_cmd failed in container {self._container_id}")
+
+    def exec(self, command: str, timeout: float = 120.0) -> ExecResult:
+        if self._container_id is None:
+            raise SandboxError("sandbox not set up")
+        abort = getattr(self, "abort", None)
+        if abort is not None and abort.is_set():
+            raise AbortError("interrupted by operator")
+        try:
+            proc = subprocess.Popen(
+                ["docker", "exec", self._container_id, "sh", "-lc", command],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+            )
+            elapsed = 0.0
+            interval = 0.1
+            limit = min(timeout, _EXEC_TIMEOUT)
+            while True:
+                if abort is not None and abort.is_set():
+                    try:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                    except OSError:
+                        pass
+                    raise AbortError("interrupted by operator")
+                try:
+                    stdout, stderr = proc.communicate(timeout=interval)
+                    return ExecResult(
+                        exit_code=proc.returncode,
+                        stdout=stdout or "",
+                        stderr=stderr or "",
+                    )
+                except subprocess.TimeoutExpired:
+                    elapsed += interval
+                    if elapsed >= limit:
+                        try:
+                            proc.kill()
+                            stdout, stderr = proc.communicate(timeout=2)
+                        except Exception:
+                            stdout, stderr = "", ""
+                        return ExecResult(
+                            exit_code=-1, stdout=stdout or "", stderr=stderr or "", timed_out=True
+                        )
+                    continue
+        except OSError as exc:
+            return ExecResult(exit_code=-1, stdout="", stderr=str(exc), timed_out=False)
+
+    def read_file(self, path: str) -> str:
+        result = self._exec_no_shell(["cat", path])
+        if result.exit_code != 0:
+            raise SandboxError(f"read_file failed for {path}: {result.stderr[:500]}")
+        return result.stdout
+
+    def write_file(self, path: str, content: str) -> None:
+        if self._container_id is None:
+            raise SandboxError("sandbox not set up")
+        # Stage locally, then docker cp; avoids shell-quoting hazards entirely.
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", newline="\n", suffix=".harness", delete=False
+        ) as handle:
+            handle.write(content)
+            temp_path = handle.name
+        try:
+            completed = subprocess.run(
+                [
+                    "docker",
+                    "cp",
+                    temp_path,
+                    f"{self._container_id}:{path}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if completed.returncode != 0:
+                raise SandboxError(
+                    f"write_file failed for {path}: {(completed.stderr or '')[:500]}"
+                )
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    def cleanup(self) -> None:
+        if self._container_id is not None:
+            self._run_cli(["docker", "rm", "-f", self._container_id])
+            self._container_id = None
+
+    def _exec_no_shell(self, args: list[str], timeout: float = 120.0) -> ExecResult:
+        if self._container_id is None:
+            raise SandboxError("sandbox not set up")
+        abort = getattr(self, "abort", None)
+        if abort is not None and abort.is_set():
+            raise AbortError("interrupted by operator")
+        try:
+            proc = subprocess.Popen(
+                ["docker", "exec", self._container_id, *args],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+            )
+            elapsed = 0.0
+            interval = 0.1
+            limit = min(timeout, _EXEC_TIMEOUT)
+            while True:
+                if abort is not None and abort.is_set():
+                    try:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                    except OSError:
+                        pass
+                    raise AbortError("interrupted by operator")
+                try:
+                    stdout, stderr = proc.communicate(timeout=interval)
+                    return ExecResult(
+                        exit_code=proc.returncode,
+                        stdout=stdout or "",
+                        stderr=stderr or "",
+                    )
+                except subprocess.TimeoutExpired:
+                    elapsed += interval
+                    if elapsed >= limit:
+                        try:
+                            proc.kill()
+                            stdout, stderr = proc.communicate(timeout=2)
+                        except Exception:
+                            stdout, stderr = "", ""
+                        return ExecResult(
+                            exit_code=-1, stdout=stdout or "", stderr=stderr or "", timed_out=True
+                        )
+                    continue
+        except OSError as exc:
+            return ExecResult(exit_code=-1, stdout="", stderr=str(exc), timed_out=False)
+
+    @staticmethod
+    def _is_safe_repo_url(url: str) -> bool:
+        url = url.strip()
+        if not url or len(url) > 2048 or "\n" in url or "\r" in url or "\x00" in url:
+            return False
+        if url.startswith(("http://", "https://", "git@", "ssh://", "git://", "file://")):
+            return True
+        return False
+
+    @staticmethod
+    def _is_safe_commit(commit: str) -> bool:
+        commit = commit.strip()
+        if not commit or len(commit) > 256 or "\n" in commit or "\r" in commit or "\x00" in commit:
+            return False
+        if any(c in commit for c in (";", "&", "|", "`", "$", "(", ")", "<", ">", '"', "'")):
+            return False
+        return True
+
+    @staticmethod
+    def _run_cli(args: list[str]) -> bool:
+        try:
+            completed = subprocess.run(
+                args, capture_output=True, text=True, timeout=120
+            )
+            return completed.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False

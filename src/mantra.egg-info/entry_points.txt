@@ -1,0 +1,3 @@
+[console_scripts]
+mantra = mantra.console:main
+mantra-headless = mantra.main:main
