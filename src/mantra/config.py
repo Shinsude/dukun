@@ -54,6 +54,9 @@ DEFAULTS = {
     "context": {"max_messages": 200, "max_chars": 240000},
     "auto_compact_tokens": 60000,  # summarise the history past this size; 0 disables
     "verbose": False,  # echo truncated tool output as it arrives
+    # Use native terminal scrollback and mouse selection in the console.
+    # Set false to opt into the fixed framed layout.
+    "native_scrollback": True,
     "skills": {
         # Attach a matching skill to a plain prompt without being asked.
         # Off still leaves /skills fully usable by hand.

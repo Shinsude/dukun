@@ -3590,12 +3590,16 @@ def main(argv: list[str] | None = None) -> int:
         # Build the frame before anything prints, so the key warning and
         # the startup card land inside the content region rather than
         # over the chrome.
-        session.layout = tui.Layout()
-        framed = session.layout.setup(session, style)
+        use_native_scrollback = bool(config.get("native_scrollback", True))
+        session.layout = None if use_native_scrollback else tui.Layout()
+        framed = False if session.layout is None else session.layout.setup(session, style)
         session._warn_if_key_missing()
         if framed:
             session.layout.show_splash()
-        sys.stdout.write(session.prompt_text())
+        elif use_native_scrollback:
+            tui.show_welcome(session, style)
+        if session.layout is not None:
+            sys.stdout.write(session.prompt_text())
         sys.stdout.flush()
     else:
         session.banner()

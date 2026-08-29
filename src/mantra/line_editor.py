@@ -357,17 +357,14 @@ class LineEditor:
 
     @contextmanager
     def _raw_mode(self):
-        """Single-key input, with mouse tracking on for the scroll wheel."""
-        sys.stdout.write("\033[?1006h")  # SGR extended mouse mode
-        sys.stdout.write("\033[?1003h")  # all mouse motion
-        sys.stdout.flush()
-        try:
-            with raw_mode():
-                yield
-        finally:
-            sys.stdout.write("\033[?1003l")
-            sys.stdout.write("\033[?1006l")
-            sys.stdout.flush()
+        """Single-key input without capturing terminal mouse events.
+
+        Mouse reporting prevents native drag selection and wheel scrolling.
+        Menus own temporary mouse capture; the line editor must leave the
+        terminal's normal selection and scroll behavior intact.
+        """
+        with raw_mode():
+            yield
 
     def _read_key(self) -> str:
         if os.name == "nt":

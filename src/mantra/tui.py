@@ -68,6 +68,17 @@ _MODE_STYLES = {
     "plan": ("○", "cyan"),
 }
 
+_WELCOME_WIDTH = 72
+_WELCOME_HEIGHT = 9
+_welcome_rows: tuple[int, int] | None = None
+
+
+def _display(value: object, fallback: str = "") -> str:
+    """Render data-derived text as safe, single-line terminal text."""
+    text = str(value if value is not None else fallback)
+    text = text.replace("\n", " ").replace("\r", " ").replace("\x1b", "")
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+
 
 def terminal_size() -> tuple[int, int]:
     """Columns and rows, with a floor for terminals that report nothing."""
@@ -186,21 +197,23 @@ def _version() -> str:
 
 def _identity(session: Any, style: Any) -> tuple[str, str]:
     """Left and right of the top header row."""
-    left = f"{style.bright_green('MANTRA')} {style.dim(_version())}"
+    bright_green = _style_fn(style, "bright_green")
+    dim = _style_fn(style, "dim")
+    left = f"{bright_green('MANTRA')} {dim(_version())}"
     cfg = getattr(session, "config", None)
     if not isinstance(cfg, dict):
         cfg = {}
     llm = cfg.get("llm")
     if not isinstance(llm, dict):
         llm = {}
-    model = str(llm.get("model") or "?")
-    effort = str(llm.get("reasoning_effort") or "off")
+    model = _display(llm.get("model"), "?")
+    effort = _display(llm.get("reasoning_effort"), "off")
     endpoint = ""
     try:
-        endpoint = str(session.endpoint_name or "")
+        endpoint = _display(session.endpoint_name or "")
     except Exception:
         endpoint = ""
-    right_bits = [b for b in (endpoint, f"{model} {style.dim('(' + effort + ')')}") if b]
+    right_bits = [b for b in (endpoint, f"{model} {dim('(' + effort + ')')}") if b]
     return left, " · ".join(right_bits)
 
 
@@ -208,20 +221,21 @@ def _context(session: Any, style: Any) -> tuple[str, str]:
     """Left and right of the second header row."""
     workspace = getattr(getattr(session, "sandbox", None), "root", "") or ""
     if workspace:
-        short = workspace.replace("\\", "/").rstrip("/").split("/")[-1] or workspace
+        short = _display(workspace.replace("\\", "/").rstrip("/").split("/")[-1] or workspace)
     else:
         short = ""
-    git = str(getattr(session, "git_state", "") or "")
-    left = short + (f" {style.dim(git)}" if git else "")
+    git = _display(getattr(session, "git_state", "") or "")
+    dim = _style_fn(style, "dim")
+    left = short + (f" {dim(git)}" if git else "")
 
     right_bits = []
     skills = getattr(session, "active_skills", None)
     if isinstance(skills, (list, tuple, set)):
         if skills:
-            right_bits.append(style.dim(f"{len(skills)} skill" + ("" if len(skills) == 1 else "s")))
-    goal = str(getattr(session, "goal", "") or "")
+            right_bits.append(dim(f"{len(skills)} skill" + ("" if len(skills) == 1 else "s")))
+    goal = _display(getattr(session, "goal", "") or "")
     if goal:
-        right_bits.append(style.dim("goal: " + goal))
+        right_bits.append(dim("goal: " + goal))
     return left, "  ".join(right_bits)
 
 
@@ -258,12 +272,13 @@ def render_status(session: Any, style: Any, cols: int) -> str:
     """One line of live session state."""
     mode = getattr(getattr(session, "approvals", None), "mode", "default")
     if not isinstance(mode, str) or mode not in _MODE_STYLES:
-        if mode not in _MODE_STYLES:
+        if isinstance(mode, str) and mode not in _MODE_STYLES:
             _log.debug("unknown approval mode %r, falling back to default", mode)
         mode = "default"
     marker, colour_name = _MODE_STYLES.get(mode, ("●", "green"))
     colour = _style_fn(style, colour_name)
-    parts = [f"{colour(marker)} {mode}"]
+    dim = _style_fn(style, "dim")
+    parts = [f"{colour(marker)} {_display(mode, 'default')}"]
 
     totals = getattr(session, "totals", None)
     if not isinstance(totals, dict):
@@ -274,7 +289,7 @@ def render_status(session: Any, style: Any, cols: int) -> str:
         _log.debug("totals.turns not numeric: %r", exc)
         turns = 0
     if turns:
-        parts.append(style.dim(f"{turns} turn" + ("" if turns == 1 else "s")))
+        parts.append(dim(f"{turns} turn" + ("" if turns == 1 else "s")))
 
     try:
         tokens_in = int(totals.get("tokens_in", 0) or 0)
@@ -289,14 +304,14 @@ def render_status(session: Any, style: Any, cols: int) -> str:
         _log.debug("context.tokens conversion failed: %r", exc)
         context = 0
     if context:
-        parts.append(style.dim(f"{_short_count(int(context))} ctx"))
+        parts.append(dim(f"{_short_count(int(context))} ctx"))
     if tokens_in and cached:
         try:
-            rate = int(cached * 100 / tokens_in)
+            rate = max(0, min(100, int(cached * 100 / tokens_in)))
         except Exception as exc:
             _log.debug("cache rate calc failed: %r", exc)
             rate = 0
-        parts.append(style.dim(f"{rate}% cached"))
+        parts.append(dim(f"{rate}% cached"))
 
     try:
         errors = int(totals.get("tool_errors", 0) or 0)
@@ -638,3 +653,45 @@ def show_splash(session: Any, style: Any) -> int:
     if layout is not None and layout.active:
         return layout.show_splash()
     return 0
+
+
+def render_welcome(session: Any, style: Any, cols: int, rows: int) -> list[str]:
+    """Create the MANTRA welcome panel used by native scrollback mode."""
+    dim = _style_fn(style, "dim")
+    bright = _style_fn(style, "bright_green")
+    bold = _style_fn(style, "bold")
+    width = min(_WELCOME_WIDTH, max(36, cols - 8))
+    body = max(20, width - 2)
+    title = f"{bold(bright('MANTRA'))}  {dim('workspace intelligence') }"
+    lines = [
+        "┌" + "─" * body + "┐",
+        "│" + _fit(title, body) + "│",
+        "│" + _fit(dim("Explore  ·  Build  ·  Verify"), body) + "│",
+        "│" + " " * body + "│",
+        "│" + _fit(dim("A focused coding workspace for deliberate changes."), body) + "│",
+        "│" + _fit(dim("Type a request, or /help for commands."), body) + "│",
+        "│" + " " * body + "│",
+        "│" + _fit(dim("Native scrollback enabled  ·  mouse selection available"), body) + "│",
+        "└" + "─" * body + "┘",
+    ]
+    return lines
+
+
+def show_welcome(session: Any, style: Any) -> None:
+    """Draw a centered welcome panel without taking over scrollback."""
+    if not sys.stdout.isatty():
+        return
+    cols, rows = terminal_size()
+    lines = render_welcome(session, style, cols, rows)
+    top = max(2, (rows - len(lines)) // 3)
+    with _lock:
+        try:
+            _write("\033[s")
+            for offset, line in enumerate(lines):
+                row = top + offset
+                _write(f"\033[{row};1H\033[2K{line}")
+            _write(f"\033[{top + len(lines) + 1};1H")
+            _write("\033[u")
+            sys.stdout.flush()
+        except Exception as exc:
+            _log.debug("welcome draw failed: %r", exc)
