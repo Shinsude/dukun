@@ -98,7 +98,7 @@ def roots() -> list[Path]:
     override = os.environ.get(_OVERRIDE_ENV, "")
     if override.strip():
         found = []
-        for part in override.split(os.pathsep if os.pathsep in override else ";"):
+        for part in re.split(r"[;:]", override):
             part = part.strip()
             if part:
                 found.append(Path(part))

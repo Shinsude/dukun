@@ -1,8 +1,8 @@
-"""MANTRA CLI entrypoint.
+"""MANTRA CLI entrypoint — headless runner.
 
 Usage:
-    python gui.py                                    desktop GUI
-    python main.py --config CONFIG --task TASK      headless run
+    python -m mantra.main --config CONFIG --task TASK
+    mantra-headless --config CONFIG --task TASK
 
 The task file is JSON matching the guide's task format (problem_statement,
 optional repo_url/base_commit/setup_cmd/test_cmd).

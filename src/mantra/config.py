@@ -72,7 +72,7 @@ _MAX_CONFIG_BYTES = 1_000_000
 
 
 def load_config(path: str) -> dict:
-    """Load a config file and merge it over the defaults (shallow per section)."""
+    """Load a config file and merge it deeply over the defaults."""
     if not os.path.isfile(path):
         raise ConfigError(f"config file not found: {path}")
     try:

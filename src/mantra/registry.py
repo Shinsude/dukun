@@ -111,11 +111,14 @@ def build_tools(names: list[str]) -> list[Tool]:
     """Instantiate tools by registry name; fail loudly on unknown names.
 
     File tools share one EditLedger instance so read-before-edit tracking
-    works across the whole tool set within a session.
+    works across the whole tool set within a session. Duplicate names and
+    aliases that resolve to the same tool class are deduplicated to avoid
+    exposing the same capability twice.
     """
     from mantra.implementations.tools.edit_ledger import EditLedger
 
     ledger = EditLedger()
+    seen_classes: set[type[Tool]] = set()
     tools = []
     for name in names:
         cls = TOOL_REGISTRY.get(name)
@@ -123,6 +126,9 @@ def build_tools(names: list[str]) -> list[Tool]:
             raise ConfigError(
                 f"unknown tool '{name}' (known: {sorted(TOOL_REGISTRY)})"
             )
+        if cls in seen_classes:
+            continue
+        seen_classes.add(cls)
         tool = cls()
         if hasattr(tool, "ledger"):
             tool.ledger = ledger

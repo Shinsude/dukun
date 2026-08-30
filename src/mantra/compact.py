@@ -43,10 +43,30 @@ def _pad(text: str, width: int) -> str:
 
 
 def _shorten(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
     if _vis(text) <= width:
         return text
-    raw = _ANSI_RE.sub("", text)
-    return raw[: max(0, width - 1)] + "…"
+    if width == 1:
+        return "…"
+    result: list[str] = []
+    vis = 0
+    limit = width - 1
+    i = 0
+    while i < len(text):
+        m = _ANSI_RE.match(text, i)
+        if m:
+            result.append(m.group(0))
+            i = m.end()
+            continue
+        ch = text[i]
+        if vis + 1 > limit:
+            break
+        result.append(ch)
+        vis += 1
+        i += 1
+    result.append("…")
+    return "".join(result)
 
 
 def _fit_line(text: str, width: int) -> str:

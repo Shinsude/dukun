@@ -98,7 +98,13 @@ class ContextManager:
             del self.messages[index:end]
             self._recount()
             return True
-        # No assistant turn left to drop: fall back to the oldest free message.
+        # No assistant turn left to drop: fall back to oldest non-tool message to avoid orphaning tool results.
+        for index in range(2, len(self.messages)):
+            if self.messages[index].get("role") != "tool":
+                del self.messages[index]
+                self._recount()
+                return True
+        # Only tool messages remain — remove the oldest tool as last resort
         if len(self.messages) > 2:
             del self.messages[2]
             self._recount()

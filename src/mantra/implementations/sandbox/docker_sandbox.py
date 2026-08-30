@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import time
 import uuid
 
 from mantra.core.exceptions import AbortError, SandboxError
@@ -96,9 +97,9 @@ class DockerSandbox(Sandbox):
                 text=True,
                 errors="replace",
             )
-            elapsed = 0.0
             interval = 0.1
             limit = min(timeout, _EXEC_TIMEOUT)
+            deadline = time.monotonic() + float(limit)
             while True:
                 if abort is not None and abort.is_set():
                     try:
@@ -118,8 +119,7 @@ class DockerSandbox(Sandbox):
                         stderr=stderr or "",
                     )
                 except subprocess.TimeoutExpired:
-                    elapsed += interval
-                    if elapsed >= limit:
+                    if time.monotonic() >= deadline:
                         try:
                             proc.kill()
                             stdout, stderr = proc.communicate(timeout=2)
@@ -132,7 +132,26 @@ class DockerSandbox(Sandbox):
         except OSError as exc:
             return ExecResult(exit_code=-1, stdout="", stderr=str(exc), timed_out=False)
 
+    def _is_safe_path(self, path: str) -> bool:
+        if not path or "\x00" in path or "\n" in path or "\r" in path or ":" in path:
+            return False
+        # Reject absolute paths and parent traversal
+        if os.path.isabs(path):
+            return False
+        parts = path.replace("\\", "/").split("/")
+        if ".." in parts:
+            return False
+        # Ensure normalized path stays inside workdir
+        normalized = os.path.normpath(path).replace("\\", "/")
+        if normalized.startswith("../") or normalized == "..":
+            return False
+        if os.path.isabs(normalized):
+            return False
+        return True
+
     def read_file(self, path: str) -> str:
+        if not self._is_safe_path(path):
+            raise SandboxError(f"path escapes sandbox workspace: {path}")
         result = self._exec_no_shell(["cat", path])
         if result.exit_code != 0:
             raise SandboxError(f"read_file failed for {path}: {result.stderr[:500]}")
@@ -141,7 +160,13 @@ class DockerSandbox(Sandbox):
     def write_file(self, path: str, content: str) -> None:
         if self._container_id is None:
             raise SandboxError("sandbox not set up")
+        if not self._is_safe_path(path):
+            raise SandboxError(f"path escapes sandbox workspace: {path}")
         # Stage locally, then docker cp; avoids shell-quoting hazards entirely.
+        # Ensure destination is absolute inside workdir to avoid relative ambiguity
+        dest = path
+        if not os.path.isabs(dest):
+            dest = os.path.join(self.workdir, dest)
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", newline="\n", suffix=".harness", delete=False
         ) as handle:
@@ -153,7 +178,7 @@ class DockerSandbox(Sandbox):
                     "docker",
                     "cp",
                     temp_path,
-                    f"{self._container_id}:{path}",
+                    f"{self._container_id}:{dest}",
                 ],
                 capture_output=True,
                 text=True,
@@ -186,9 +211,9 @@ class DockerSandbox(Sandbox):
                 text=True,
                 errors="replace",
             )
-            elapsed = 0.0
             interval = 0.1
             limit = min(timeout, _EXEC_TIMEOUT)
+            deadline = time.monotonic() + float(limit)
             while True:
                 if abort is not None and abort.is_set():
                     try:
@@ -208,8 +233,7 @@ class DockerSandbox(Sandbox):
                         stderr=stderr or "",
                     )
                 except subprocess.TimeoutExpired:
-                    elapsed += interval
-                    if elapsed >= limit:
+                    if time.monotonic() >= deadline:
                         try:
                             proc.kill()
                             stdout, stderr = proc.communicate(timeout=2)

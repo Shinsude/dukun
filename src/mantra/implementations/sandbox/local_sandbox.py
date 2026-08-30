@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 from mantra.core.exceptions import AbortError, SandboxError
 from mantra.interfaces.sandbox import ExecResult, Sandbox
@@ -134,8 +135,8 @@ class LocalSandbox(Sandbox):
                 text=True,
                 errors="replace",
             )
-            elapsed = 0.0
             interval = 0.1
+            deadline = time.monotonic() + float(timeout)
             while True:
                 if abort is not None and abort.is_set():
                     try:
@@ -155,8 +156,7 @@ class LocalSandbox(Sandbox):
                         stderr=stderr or "",
                     )
                 except subprocess.TimeoutExpired:
-                    elapsed += interval
-                    if elapsed >= timeout:
+                    if time.monotonic() >= deadline:
                         try:
                             proc.kill()
                             stdout, stderr = proc.communicate(timeout=2)
@@ -182,6 +182,13 @@ class LocalSandbox(Sandbox):
         parent = os.path.dirname(full)
         if parent:
             os.makedirs(parent, exist_ok=True)
+            # Re-validate after makedirs to mitigate TOCTOU symlink swap
+            real_parent = os.path.realpath(parent)
+            real_base = os.path.realpath(self.root)
+            if not (real_parent == real_base or real_parent.startswith(real_base + os.sep)):
+                raise SandboxError(f"path escapes sandbox workspace: {path}")
+            # Also re-resolve full path after parent creation
+            full = self._resolve(path)
         with open(full, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
         self.changed.add(path.replace("\\", "/"))
@@ -219,8 +226,8 @@ class LocalSandbox(Sandbox):
                 text=True,
                 errors="replace",
             )
-            elapsed = 0.0
             interval = 0.1
+            deadline = time.monotonic() + float(timeout)
             while True:
                 if abort is not None and abort.is_set():
                     try:
@@ -240,8 +247,7 @@ class LocalSandbox(Sandbox):
                         stderr=stderr or "",
                     )
                 except subprocess.TimeoutExpired:
-                    elapsed += interval
-                    if elapsed >= timeout:
+                    if time.monotonic() >= deadline:
                         try:
                             proc.kill()
                             stdout, stderr = proc.communicate(timeout=2)
