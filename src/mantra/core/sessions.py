@@ -33,9 +33,6 @@ from typing import Any
 _VERSION = 1
 _OVERRIDE_ENV = "MANTRA_SESSIONS"
 
-# Below this a session is noise - a turn or two of "hello" - and listing
-# it would bury the ones worth resuming.
-_MIN_MESSAGES = 2
 
 
 def sessions_dir() -> Path:
@@ -63,15 +60,51 @@ def derive_name(workspace: str = "", model: str = "") -> str:
     keeps two sessions from the same directory from colliding, and it
     sorts usefully because it reads year-month-day.
     """
+    import uuid
+
     base = _slug(Path(workspace or "").name) if workspace else ""
     if not base and model:
         base = _slug(model)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return f"{base}-{stamp}" if base else stamp
+    candidate = f"{base}-{stamp}" if base else stamp
+    # Avoid collisions within the same second by appending a short suffix
+    # only when a file with the same name already exists.
+    if _path(candidate).exists():
+        candidate = f"{candidate}-{uuid.uuid4().hex[:4]}"
+        # Extremely unlikely second collision
+        if _path(candidate).exists():
+            candidate = f"{candidate}-{uuid.uuid4().hex[:2]}"
+    return candidate
 
 
 def _path(name: str) -> Path:
     return sessions_dir() / f"{name}.json"
+
+
+# A transcript is rewritten after every turn, so without a ceiling both
+# the file and the cost of a turn grow with the length of the session.
+# Long tool output is trimmed rather than the message dropped, because a
+# dropped message can orphan the tool call it answers.
+_MAX_MESSAGE_CHARS = 20_000
+
+
+def _trim_messages(messages: list[Any]) -> list[Any]:
+    """Cap each message's content so the transcript stays bounded."""
+    trimmed: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            trimmed.append(message)
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or len(content) <= _MAX_MESSAGE_CHARS:
+            trimmed.append(message)
+            continue
+        copy = dict(message)
+        copy["content"] = (
+            content[:_MAX_MESSAGE_CHARS].rstrip() + "\n... [truncated on save]"
+        )
+        trimmed.append(copy)
+    return trimmed
 
 
 def save(name: str, payload: dict[str, Any]) -> str | None:
@@ -82,12 +115,39 @@ def save(name: str, payload: dict[str, Any]) -> str | None:
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         **payload,
     }
+    messages = record.get("messages")
+    if isinstance(messages, list):
+        record["messages"] = _trim_messages(messages)
     target = _path(name)
+    # Ensure directory exists and has restricted permissions
     try:
-        with open(target, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(record, handle, ensure_ascii=False, indent=2)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(target.parent, 0o700)
+        except OSError:
+            pass
     except OSError:
-        return None
+        pass
+    content = json.dumps(record, ensure_ascii=False, indent=2)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(target)
+    except OSError:
+        try:
+            with open(target, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(content)
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            return None
     return str(target)
 
 

@@ -37,11 +37,15 @@ _REASONING_RE = re.compile("|".join(re.escape(h) for h in _REASONING_HINTS), re.
 # in a chat picker is not a neutral extra row, it is a wrong answer the
 # operator has to recognise and skip, and on a large account they are
 # most of the list.
+# "instruct" used to be filtered outright, which silently hid perfectly
+# ordinary chat models whose names happen to contain it. Only the legacy
+# completion families are noise; everything else stays in the catalogue.
 _NOISE_RE = re.compile(
     r"("
     r"embedding|whisper|transcri\w*|speech|audio|realtime|"
     r"tts|dall-e|image|sora|video|moderation|"
-    r"rerank|re-rank|similarity|babbage|davinci|instruct|"
+    r"rerank|re-rank|similarity|babbage|davinci|"
+    r"turbo-instruct|instruct-?\d+\.?\d*$|"
     r"computer-use|codex-mini"
     r")",
     re.IGNORECASE,

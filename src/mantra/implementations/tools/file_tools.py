@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import os
+import re
+import shlex
 from typing import Any
 
 from mantra.interfaces.sandbox import Sandbox
 from mantra.interfaces.tool import Tool
+
+_SHELL_META_RE = re.compile(r"[;&|`$()<>]")
 
 _MAX_READ_CHARS = 20000
 
@@ -77,27 +81,23 @@ class EditFileTool(Tool):
     ) -> str:
         content = sandbox.read_file(path)
         if self.ledger is not None:
-            # Auto-record the read so edits work without an explicit read_file first.
             if not self.ledger.has_seen(path):
-                self.ledger.remember(path, content)
+                return (
+                    f"ERROR: read {path} with read_file before editing "
+                    "(no recorded read this session)"
+                )
             if not self.ledger.is_current(path, content):
-                # File changed on disk — re-record and proceed.
-                self.ledger.remember(path, content)
+                return (
+                    f"ERROR: {path} changed on disk since your last read - "
+                    "read it again, then retry the edit"
+                )
         if old_string not in content:
             return f"ERROR: old_string not found in {path}"
         new_content = content.replace(old_string, new_string, 1)
         sandbox.write_file(path, new_content)
         if self.ledger is not None:
             self.ledger.remember(path, new_content)
-        # Build a unified diff of the change.
-        old_lines = old_string.splitlines(keepends=True)
-        new_lines = new_string.splitlines(keepends=True)
-        diff_lines = [f"--- {path}\n", f"+++ {path}\n"]
-        for line in old_lines:
-            diff_lines.append(f"- {line.rstrip()}\n")
-        for line in new_lines:
-            diff_lines.append(f"+ {line.rstrip()}\n")
-        return "".join(diff_lines)
+        return f"OK: edited {path}"
 
 
 class ListDirTool(Tool):
@@ -110,29 +110,39 @@ class ListDirTool(Tool):
     }
 
     def execute(self, sandbox: Sandbox, path: str) -> str:
+        # Basic validation to reduce injection risk for shell fallbacks
+        if "\x00" in path or "\n" in path or "\r" in path:
+            return "ERROR: invalid path"
         root = getattr(sandbox, "root", None)
         if root is None:
             # Sandboxes without a direct file view list via shell.
-            # Try portable listings for different environments.
+            # Validate against shell metacharacters and use safe quoting.
+            if _SHELL_META_RE.search(path) or '"' in path or "'" in path:
+                return "ERROR: path contains unsupported characters for shell listing"
+            quoted = shlex.quote(path)
             for cmd in (
-                f'ls -la "{path}"',
-                f'ls -1 "{path}"',
-                f'dir "{path}"',
-                f'python -c "import os,sys; p=sys.argv[1]; print(chr(10).join(sorted(os.listdir(p))))" "{path}"',
+                f"ls -la {quoted}",
+                f"ls -1 {quoted}",
+                f"python -c \"import os,sys; p=sys.argv[1]; print(chr(10).join(sorted(os.listdir(p))))\" {quoted}",
             ):
                 result = sandbox.exec(cmd)
                 if result.exit_code == 0 and result.stdout.strip():
                     return result.stdout
             return result.stdout if result.exit_code == 0 else f"ERROR: {result.stderr or 'listing failed'}"
 
+        # Direct file view: resolve and ensure confinement
         base = root if path in (".", "") else os.path.join(root, path)
         try:
-            entries = sorted(os.listdir(base))
+            real_base = os.path.realpath(base)
+            real_root = os.path.realpath(root)
+            if not (real_base == real_root or real_base.startswith(real_root + os.sep)):
+                return f"ERROR: path escapes workspace: {path}"
+            entries = sorted(os.listdir(real_base))
         except OSError as exc:
             return f"ERROR: {exc}"
         lines = []
         for entry in entries:
-            full = os.path.join(base, entry)
+            full = os.path.join(real_base, entry)
             marker = "/" if os.path.isdir(full) else ""
             lines.append(entry + marker)
         return "\n".join(lines) or "(empty directory)"
