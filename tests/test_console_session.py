@@ -616,8 +616,8 @@ class ReplyRenderingTest(unittest.TestCase):
         # Use a streamed reply so the footer (which carries
         # the step count) is produced.
         out = self._framed_output([final_response("done", stream=True)])
-        self.assertIn("1 step", out)
-        self.assertNotIn("1 steps", out)
+        self.assertIn("1 STEP", out)
+        self.assertNotIn("1 STEPS", out)
 
 
 def _tty_stdin():

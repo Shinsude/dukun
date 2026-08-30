@@ -643,7 +643,7 @@ class CompactLayout:
                 self._enter_locked()
 
             _safe_write("\033[2J\033[H")
-            self._draw_chrome_locked(skip_prompt=True)
+            self._draw_chrome_locked(skip_prompt=False)
             self._render_content_locked()
             self._apply_region_locked()
 
