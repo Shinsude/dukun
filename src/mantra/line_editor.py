@@ -146,6 +146,7 @@ class LineEditor:
         # Absolute row for the prompt (when known). Used to compute
         # absolute rows for popup above, avoiding newlines in scroll region.
         self.fixed_row: int | None = None
+        self._prev_fixed_row: int | None = None
 
     # ΓöÇΓöÇ public API ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
@@ -307,6 +308,11 @@ class LineEditor:
                 self.fixed_row = shutil.get_terminal_size().lines
             except Exception:
                 pass
+
+        # If fixed_row moved (resize), clear old prompt row that is now inside content
+        if self.fixed_row is not None and self._prev_fixed_row is not None and self.fixed_row != self._prev_fixed_row:
+            out.write(f"\033[{self._prev_fixed_row};1H\033[2K")
+        self._prev_fixed_row = self.fixed_row
 
         # Step 1: Clear old popup rows. Use absolute rows when a fixed
         # bottom prompt is active (no newlines inside scroll region), else
