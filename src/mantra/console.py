@@ -1330,6 +1330,12 @@ class ConsoleSession:
             "cache_hit": cache,
             "cache_rate": rate,
         })
+        # Wire CACHE instantly — top bar shows hit rate without waiting for next chrome redraw
+        if self.layout is not None and getattr(self.layout, "active", False):
+            try:
+                self.layout.draw_chrome()
+            except Exception:
+                pass
 
     def _usage_line(self, result: RunResult) -> str:
         tin = int(result.metrics.get("tokens_in", 0))
@@ -1338,11 +1344,11 @@ class ConsoleSession:
         steps = result.steps_used
         elapsed = time.monotonic() - self._turn_started
         elapsed_str = _format_elapsed(elapsed)
-        cache_bit = f" · {_short(cache)} cached" if cache else ""
+        cache_bit = f" · {_short(cache)} CACHED" if cache else ""
         if not tin and not tout:
-            return f"{elapsed_str} · {steps} step{cache_bit} · CTX {_short(self.context.tokens)}"
+            return f"{elapsed_str} · {steps} STEP{cache_bit} · CTX {_short(self.context.tokens)}"
         return (
-            f"{elapsed_str} · {steps} step · "
+            f"{elapsed_str} · {steps} STEP · "
             f"I/O {_short(tin)} / {_short(tout)}{cache_bit} · CTX {_short(self.context.tokens)}"
         )
 
@@ -1752,6 +1758,12 @@ class ConsoleSession:
             self._print(self.style.dim(f"  model is now {name}"))
         self.refresh_title()
         self._warn_if_key_missing()
+        # Wire top info instantly so MODEL shows new name without waiting for next turn
+        if self.layout is not None and getattr(self.layout, "active", False):
+            try:
+                self.layout.draw_chrome()
+            except Exception:
+                pass
 
     def set_reasoning(self, level: str, quiet: bool = False) -> None:
         """Set the thinking budget for the current model.
@@ -1779,6 +1791,11 @@ class ConsoleSession:
                 self.style.dim(f"  reasoning is now {wanted}" if wanted else "  reasoning off")
             )
         self.refresh_title()
+        if self.layout is not None and getattr(self.layout, "active", False):
+            try:
+                self.layout.draw_chrome()
+            except Exception:
+                pass
 
     def show_reasoning(self) -> None:
         effort = self.config.get("llm", {}).get("reasoning_effort")
@@ -1822,6 +1839,11 @@ class ConsoleSession:
         self._print(self.style.dim(f"  endpoint is now {entry['base_url']}"))
         self.refresh_title()
         self._warn_if_key_missing()
+        if self.layout is not None and getattr(self.layout, "active", False):
+            try:
+                self.layout.draw_chrome()
+            except Exception:
+                pass
         return True
 
     def _warn_if_key_missing(self) -> None:

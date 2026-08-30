@@ -476,15 +476,17 @@ class CompactLayout:
         else:
             rate = "—"
 
+        # Model display with reasoning, always shown so a mid-session /model change is visible instantly
+        model_display = f"{model} ({reasoning})"
         items = []
         if st and enabled:
             items.append(st.dim("WORKSPACE: ") + st.bright_white(ws_short))
-            items.append(st.dim("MODEL: ") + st.bright_white(model))
+            items.append(st.dim("MODEL: ") + st.bright_white(model_display))
             items.append(st.dim("APPROVAL: ") + st.bright_white(approval))
             items.append(st.dim("CACHE: ") + st.bright_white(rate))
         else:
             items.append(f"WORKSPACE: {ws_short}")
-            items.append(f"MODEL: {model}")
+            items.append(f"MODEL: {model_display}")
             items.append(f"APPROVAL: {approval}")
             items.append(f"CACHE: {rate}")
 
