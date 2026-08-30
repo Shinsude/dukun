@@ -302,21 +302,12 @@ class LineEditor:
         out = sys.stdout
         import shutil
 
-        # Keep fixed_row in sync with actual terminal rows when pinned
-        if self.popup_above:
+        # Auto-compute fixed_row if not set externally.
+        if self.popup_above and self.fixed_row is None:
             try:
-                actual = shutil.get_terminal_size().lines
-                if actual and actual != self.fixed_row:
-                    if self._prev_fixed_row is None:
-                        self._prev_fixed_row = self.fixed_row
-                    self.fixed_row = actual
+                self.fixed_row = shutil.get_terminal_size().lines
             except Exception:
                 pass
-            if self.fixed_row is None:
-                try:
-                    self.fixed_row = shutil.get_terminal_size().lines
-                except Exception:
-                    pass
 
         # If fixed_row moved (resize), clear old prompt row that is now inside content
         if self.fixed_row is not None and self._prev_fixed_row is not None and self.fixed_row != self._prev_fixed_row:

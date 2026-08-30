@@ -3566,7 +3566,7 @@ def main(argv: list[str] | None = None) -> int:
         session.layout = layout
         layout.setup(0, session, style)
         layout.show_splash()
-        layout.draw_prompt()
+        # Prompt is owned exclusively by LineEditor — not drawn here to avoid duplication
     else:
         session.banner()
     try:
@@ -3644,8 +3644,7 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
 
             if fixed_bottom:
                 line = reader(session.prompt_text(), skip_newline=True).strip()
-                if session.layout is not None:
-                    session.layout.draw_prompt()
+                # Prompt owned by LineEditor — layout does not redraw here
             elif session.frame is not None:
                 session.frame.row("")
                 line = reader(session.prompt_text()).strip()

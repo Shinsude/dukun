@@ -515,17 +515,13 @@ class CompactLayout:
         # Draw top info bar.
         self._draw_info_bar_locked()
 
-        # Clear reserved bottom rows using clamped positions.
-        _safe_write("\033[998;1H\033[2K")  # border row
-        _safe_write("\033[999;1H\033[2K")  # prompt row
+        _safe_write(f"\033[{self.border_row};1H\033[2K")
 
         # Border line.
         border = _grey("─" * max(0, self._cols), enabled)
-        _safe_write(f"\033[998;1H{border}")
+        _safe_write(f"\033[{self.border_row};1H{border}")
 
-        # Prompt (skipped during resize to avoid duplication).
-        if not skip_prompt:
-            self._draw_prompt_locked("")
+        # Prompt is owned exclusively by LineEditor — do not draw here to avoid duplication
 
         sys.stdout.flush()
         self._apply_region_locked()
@@ -538,10 +534,10 @@ class CompactLayout:
             _safe_write("\033[r")
             if text:
                 line = _fit_line(text, self._cols)
-                _safe_write(f"\033[998;1H\033[2K{line}")
+                _safe_write(f"\033[{self.border_row};1H\033[2K{line}")
             else:
                 border = _grey("─" * max(0, self._cols), enabled)
-                _safe_write(f"\033[998;1H\033[2K{border}")
+                _safe_write(f"\033[{self.border_row};1H\033[2K{border}")
             sys.stdout.flush()
             self._apply_region_locked()
 
@@ -576,8 +572,7 @@ class CompactLayout:
         if not body:
             body = self._prompt_body_locked()
         body = _fit_line(body, self._cols)
-        # Use row 999 — terminal clamps to actual last row.
-        _safe_write(f"\033[999;1H\033[2K{body}")
+        _safe_write(f"\033[{self.prompt_row};1H\033[2K{body}")
 
     # ── splash ────────────────────────────────────────────────
 
