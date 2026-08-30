@@ -834,16 +834,18 @@ class ConsoleSession:
         """Update the live token counter in the bottom prompt row."""
         if self.layout is None or not self.layout.active:
             return
-        # Throttle: only update every 100ms.
+        # Throttle: only update every 100ms to avoid flicker.
         now = time.monotonic()
         if now - self._last_counter_update < 0.1:
             return
         self._last_counter_update = now
-        counter = self.style.dim(f"\u00b7\u00b7 ~{self._stream_tokens} tok ")
+        # Use short form (1.2k) and caps for visual consistency with top bar; prompt stays gold, counter is bright cyan for visibility
+        tok_str = _short(self._stream_tokens)
+        counter = self.style.bright_cyan(f" {tok_str} TOK ↓ ")
         if self.style.enabled:
-            body = self.style.bright_yellow("\u2502 MANTRA > ") + counter
+            body = self.style.bright_yellow("\u2502 MANTRA >") + counter
         else:
-            body = "\u2502 MANTRA > " + counter
+            body = "\u2502 MANTRA >" + counter
         self.layout.draw_prompt(body=body)
 
     # ---- approvals -------------------------------------------------------
