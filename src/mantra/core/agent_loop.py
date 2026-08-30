@@ -19,7 +19,6 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Any
 
 from mantra.core.context import ContextManager
@@ -107,12 +106,10 @@ class AgentLoop:
         final_message: str | None = None
         steps = 0
         aborted = False
-        provisioned = False
         metrics: dict[str, float] = {"tool_errors": 0, "denied": 0}
 
         try:
             self.sandbox.setup(task)
-            provisioned = True
             while steps < self.max_steps:
                 if self.aborted:
                     stopped_reason = "aborted"
@@ -128,10 +125,8 @@ class AgentLoop:
                     stopped_reason = "final"
                     final_message = response.content
                     # The answer has to reach history too, or the next turn
-                    # cannot see what was just said. A model that streams no
-                    # content yields None, and a null content field is
-                    # rejected by several servers on the next request.
-                    context.append({"role": "assistant", "content": response.content or ""})
+                    # cannot see what was just said.
+                    context.append({"role": "assistant", "content": response.content})
                     break
 
                 # Record the assistant turn once per model reply.
@@ -153,14 +148,9 @@ class AgentLoop:
                     }
                 )
 
-                for position, call in enumerate(response.tool_calls):
+                for call in response.tool_calls:
                     if self.aborted:
                         stopped_reason = "aborted"
-                        # Every call the model declared must be answered,
-                        # or the history ends with an assistant message
-                        # whose tool calls have no results - which the
-                        # server rejects on the next request.
-                        self._cancel_calls(context, response.tool_calls[position:])
                         break
                     observation = self._dispatch_tool(task_id, steps, call, metrics)
                     context.append(
@@ -173,6 +163,8 @@ class AgentLoop:
                     )
                 if stopped_reason == "aborted":
                     break
+            else:
+                stopped_reason = "max_steps"
         except AbortError:
             aborted = True
             stopped_reason = "aborted"
@@ -182,21 +174,9 @@ class AgentLoop:
             final_message = f"mantra error: {exc}"
             self._emit("run_error", {"task_id": task_id, "error": str(exc)})
         finally:
-            # Last line of defence: whatever happened above, the history
-            # handed back to the caller must not be one the server will
-            # refuse on the next turn.
-            self._balance_history(context)
             if aborted or stopped_reason == "aborted":
                 evaluation = EvaluationResult(
                     passed=False, detail="interrupted before completion"
-                )
-            elif not provisioned:
-                # Grading a sandbox that never came up runs the test
-                # command in an empty directory and presents the outcome
-                # as this run's verdict, which is simply untrue.
-                evaluation = EvaluationResult(
-                    passed=False,
-                    detail="sandbox provisioning failed; the run was not evaluated",
                 )
             else:
                 try:
@@ -224,57 +204,6 @@ class AgentLoop:
         self._emit("run_end", _result_payload(result))
         self.logger.log("run_result", _result_payload(result))
         return result
-
-    @staticmethod
-    def _cancel_calls(context: ContextManager, calls) -> None:
-        """Answer calls that will never run, so the history stays balanced."""
-        for call in calls:
-            context.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "name": call.name,
-                    "content": "ERROR: cancelled - the operator interrupted this run",
-                }
-            )
-
-    def _balance_history(self, context: ContextManager) -> None:
-        """Answer any tool call left dangling at the end of the history.
-
-        A trailing assistant message that declares calls without matching
-        results is rejected outright by the chat-completions protocol, and
-        because a console session reuses one context across turns, a
-        single interruption would otherwise poison every later turn.
-        """
-        for index, message in enumerate(context.messages):
-            if message.get("role") != "assistant":
-                continue
-            calls = message.get("tool_calls") or []
-            if not calls:
-                continue
-            kind = type(message).__name__
-            del kind  # messages are plain dicts; kept for clarity in tracebacks
-        # Only the final assistant message can be unbalanced: earlier ones
-        # are closed by the loop before the next one is appended.
-        if not context.messages:
-            return
-        tail = context.messages[-1]
-        if tail.get("role") != "assistant" or not (tail.get("tool_calls") or []):
-            return
-        answered = {
-            message.get("tool_call_id")
-            for message in context.messages
-            if message.get("role") == "tool"
-        }
-        pending = [c for c in tail["tool_calls"] if c.get("id") not in answered]
-        if pending:
-            self._cancel_calls(
-                context,
-                [
-                    SimpleNamespace(id=c.get("id", ""), name=(c.get("function") or {}).get("name", ""))
-                    for c in pending
-                ],
-            )
 
     def _dispatch_tool(
         self, task_id: str, step: int, call, metrics: dict[str, float]
@@ -313,16 +242,17 @@ class AgentLoop:
             observation = f"ERROR: tool '{call.name}' failed: {exc}"
         if isinstance(observation, str) and observation.startswith("ERROR"):
             metrics["tool_errors"] += 1
-        self._emit(
-            "tool_result",
-            {
-                "task_id": task_id,
-                "step": step,
-                "tool": call.name,
-                "seconds": round(time.monotonic() - started, 3),
-                "ok": not str(observation).startswith("ERROR"),
-            },
-        )
+        # Include observation for file-edit tools so the UI can show diffs.
+        result_payload: dict = {
+            "task_id": task_id,
+            "step": step,
+            "tool": call.name,
+            "seconds": round(time.monotonic() - started, 3),
+            "ok": not str(observation).startswith("ERROR"),
+        }
+        if call.name in ("edit_file", "write_file"):
+            result_payload["result"] = observation
+        self._emit("tool_result", result_payload)
         return observation
 
     def _seed_context(self, context: ContextManager, task: dict[str, Any]) -> None:
@@ -335,13 +265,6 @@ class AgentLoop:
         if not context.messages:
             context.seed(self.system_prompt, rendered)
         else:
-            # Keep the pinned system message up to date if the caller
-            # supplied a new system prompt for this turn (e.g. standing
-            # goal or skill attachment). This covers reuse of the same
-            # context across multiple runs.
-            if context.messages[0].get("role") == "system" and context.messages[0].get("content") != self.system_prompt:
-                context.messages[0]["content"] = self.system_prompt
-                context.resync()
             context.append({"role": "user", "content": rendered})
 
     def _absorb_usage(self, response, metrics: dict[str, float]) -> None:

@@ -56,18 +56,10 @@ def _save(data: dict[str, Any]) -> None:
     path = credentials_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     _restrict_dir(path.parent)
-    content = json.dumps(data, indent=2, sort_keys=True) + "\n"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        tmp.write_text(content, encoding="utf-8")
-        _restrict_file(tmp)
-        tmp.replace(path)
-    except OSError:
-        try:
-            path.write_text(content, encoding="utf-8")
-            _restrict_file(path)
-        except OSError:
-            pass
+    path.write_text(
+        json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    _restrict_file(path)
 
 
 def _restrict_dir(directory: Path) -> None:

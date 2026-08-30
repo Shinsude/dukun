@@ -22,7 +22,7 @@ User-wide endpoint and model selections are kept in a separate hand-editable doc
 
 A workspace directory holds the repository under test. If the directory lacks version control initialization, an empty repository is initialized automatically. The workspace is reused across turns in interactive mode, and its location can be overridden at launch. Repository-specific instructions are discovered by searching the workspace root for well-known filenames, and the first match is used.
 
-Durable per-workspace memory is maintained under a hidden directory inside the workspace and is capped to prevent unbounded growth. The system prompt is assembled from the base instruction, environment facts, known-failure knowledge, durable memory tail, and any repository instructions. It is rebuilt for each turn rather than frozen at startup, because the standing goal and any attached skills are set and cleared while the session is running. The environment facts are gathered the first time the prompt is needed, not during construction, so startup does not wait on version-control probes.
+Durable per-workspace memory is maintained under a hidden directory inside the workspace and is capped to prevent unbounded growth. The system prompt is assembled once per session from the base instruction, environment facts, known-failure knowledge, durable memory tail, and any repository instructions.
 
 The interactive console requires a terminal for full functionality. When standard input or output is not a terminal, the console falls back to plain line input and omits decorative framing. A non-interactive single-message mode is available for scripting.
 

@@ -14,7 +14,7 @@ The knowledge module assembles the system prompt from environment facts, known-f
 
 ## Approvals
 
-The approval module classifies each tool invocation into safe, mutating, or destructive. File writes and edits are mutating, while certain shell commands are classified as destructive via pattern matching. A shell command is split into statements and every statement must be safe for the whole to count as safe: an allowlisted verb is not enough on its own, because a leading verb says nothing about a redirect or a delete action later in the line. Four modes are defined that differ in which categories are auto-allowed and which require prompting, and the strictest is the shipped default. The policy remembers affirmative answers for the remainder of the session on a per-tool-key basis.
+The approval module classifies each tool invocation into safe, mutating, or destructive. File writes and edits are mutating, while certain shell commands are classified as destructive via pattern matching. Four modes are defined that differ in which categories are auto-allowed and which require prompting. The policy remembers affirmative answers for the remainder of the session on a per-tool-key basis.
 
 ## Events and Exceptions
 

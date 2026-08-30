@@ -37,16 +37,5 @@ class EditLedger:
 
     @staticmethod
     def _key(path: str) -> str:
-        """One entry per real file.
-
-        Separators are normalised so ``a\\b.py`` and ``a/b.py`` agree,
-        and a single leading ``./`` is dropped. Stripping the characters
-        "." and "/" wholesale collided ``.env`` with ``env`` and
-        ``.hidden/x`` with ``hidden/x``, so a read of one satisfied the
-        edit guard for the other - the exact failure the guard exists to
-        prevent.
-        """
-        normalized = path.replace("\\", "/")
-        while normalized.startswith("./"):
-            normalized = normalized[2:]
-        return normalized
+        # Normalize separators so "a\\b.py" and "a/b.py" are one entry.
+        return path.replace("\\", "/").lstrip("./")

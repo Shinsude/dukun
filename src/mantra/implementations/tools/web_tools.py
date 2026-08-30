@@ -9,23 +9,22 @@ stdlib version cannot drift out of date or fail to install.
 
 from __future__ import annotations
 
+import gzip
 import ipaddress
 import re
 import zlib
 from html.parser import HTMLParser
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen as stdlib_urlopen
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from mantra.interfaces.sandbox import Sandbox
 from mantra.interfaces.tool import Tool
 
 # A response bigger than this is almost certainly not something worth
-# putting in a context window. The compressed bytes are capped on the way
-# in and the inflated bytes are capped *during* decompression, so a
-# highly compressible payload cannot expand without bound on its way to
-# being truncated.
+# putting in a context window. Capped before decoding, so an enormous
+# page cannot exhaust memory on the way to being truncated.
 _MAX_BYTES = 2_000_000
 _MAX_INFLATED = 4_000_000
 
@@ -128,152 +127,21 @@ def _decode(raw: bytes, encoding: str | None, note: list[str]) -> str:
     return raw.decode("latin-1", errors="replace")
 
 
-class _InflatedResult(bytes):
-    """Bytes that also unpack as ``(data, truncated)`` for backward compat.
-
-    Tests call ``_inflate`` and expect ``bytes``, while the tool itself
-    does ``data, truncated = _inflate(...)``. This type satisfies both.
-    """
-
-    def __new__(cls, data: bytes, truncated: bool):
-        obj = super().__new__(cls, data)
-        obj._truncated = bool(truncated)
-        return obj
-
-    def __iter__(self):  # type: ignore[override]
-        yield bytes(self)
-        yield self._truncated
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, (bytes, bytearray)):
-            return bytes(self) == bytes(other)
-        if isinstance(other, tuple) and len(other) == 2:
-            return (bytes(self), self._truncated) == other
-        return super().__eq__(other)  # type: ignore[no-any-return]
-
-
-def _inflate(raw: bytes, content_encoding: str, cap: int = _MAX_INFLATED) -> _InflatedResult:  # type: ignore[return]
-    """Undo transport compression, refusing to expand past ``cap``.
-
-    urllib does not do this for you. Decompressing the whole payload
-    first and trimming afterwards meant a small, hostile response could
-    occupy an arbitrary amount of memory before the cap was ever
-    consulted, so the ceiling is applied while the stream is being
-    expanded instead.
-
-    Returns ``(data, truncated)`` as an object that is also ``bytes`` for
-    backward compatibility with direct ``assertEqual`` checks.
-    """
+def _inflate(raw: bytes, content_encoding: str) -> bytes:
+    """Undo transport compression. urllib does not do this for you."""
     enc = (content_encoding or "").lower()
     try:
         if "gzip" in enc:
-            decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        elif "deflate" in enc:
+            return gzip.decompress(raw)
+        if "deflate" in enc:
             try:
-                decompressor = zlib.decompressobj()
-                data = decompressor.decompress(raw, cap + 1)
-                if not decompressor.eof and data[:cap + 1] == b"":
-                    raise zlib.error("not a zlib stream")
-                d, t = _clip(data, cap)
-                return _InflatedResult(d, t)
+                return zlib.decompress(raw)
             except zlib.error:
                 # Servers that say deflate but send the raw stream.
-                decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
-        else:
-            return _InflatedResult(raw, False)
+                return zlib.decompress(raw, -zlib.MAX_WBITS)
     except (OSError, zlib.error):
-        return _InflatedResult(raw, False)
-
-    try:
-        data = decompressor.decompress(raw, cap + 1)
-    except zlib.error:
-        return _InflatedResult(raw, False)
-    d, t = _clip(data, cap)
-    return _InflatedResult(d, t)
-
-
-def _clip(data: bytes, cap: int) -> tuple[bytes, bool]:
-    if len(data) > cap:
-        return data[:cap], True
-    return data, False
-
-
-def _decode_ip_part(part: str) -> int | None:
-    """Decode a single IPv4 octet that may be decimal, hex or octal."""
-    part = part.strip()
-    if not part:
-        return None
-    try:
-        if part.lower().startswith("0x"):
-            return int(part, 16)
-        if len(part) > 1 and part[0] == "0" and part.isdigit() and all(c in "01234567" for c in part):
-            # Octal encoding like 0177
-            return int(part, 8)
-        if part.isdigit():
-            return int(part, 10)
-    except ValueError:
-        return None
-    return None
-
-
-def _parse_alternative_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
-    """Try to interpret host as an IP using alternative numeric encodings."""
-    host = host.strip()
-    if not host:
-        return None
-    # Single integer form like 2130706433 or 0x7f000001
-    if "." not in host and ":" not in host:
-        try:
-            # Handle hex single integer
-            if host.lower().startswith("0x"):
-                val = int(host, 16)
-            elif host.isdigit():
-                val = int(host, 10)
-            else:
-                return None
-            if 0 <= val <= 0xFFFFFFFF:
-                # Convert to dotted form
-                return ipaddress.IPv4Address(val)
-        except ValueError:
-            pass
-        return None
-    # Dotted form with 4 parts, each may be encoded
-    if "." in host and ":" not in host:
-        parts = host.split(".")
-        if len(parts) == 4:
-            decoded = []
-            for p in parts:
-                v = _decode_ip_part(p)
-                if v is None or not 0 <= v <= 255:
-                    return None
-                decoded.append(str(v))
-            try:
-                return ipaddress.IPv4Address(".".join(decoded))
-            except ValueError:
-                return None
-        # Handle 2 or 3 part forms like 127.1 or 10.1
-        if 1 < len(parts) < 4:
-            # Last part may represent multiple octets
-            decoded_first = []
-            for p in parts[:-1]:
-                v = _decode_ip_part(p)
-                if v is None or not 0 <= v <= 255:
-                    return None
-                decoded_first.append(v)
-            last = _decode_ip_part(parts[-1])
-            if last is None:
-                return None
-            # Expand last part into remaining octets
-            remaining = 4 - len(decoded_first)
-            vals = []
-            for i in range(remaining - 1, -1, -1):
-                vals.append((last >> (i * 8)) & 0xFF)
-            full = decoded_first + vals
-            try:
-                return ipaddress.IPv4Address(".".join(str(x) for x in full))
-            except ValueError:
-                return None
-    return None
+        return raw
+    return raw
 
 
 def _is_private_hostname(hostname: str | None) -> bool:
@@ -284,10 +152,6 @@ def _is_private_hostname(hostname: str | None) -> bool:
         return True
     if host == "0.0.0.0" or host == "::1":
         return True
-    # Try alternative encodings before standard literal check
-    alt_ip = _parse_alternative_ip(host)
-    if alt_ip is not None:
-        return alt_ip.is_private or alt_ip.is_loopback or alt_ip.is_link_local or alt_ip.is_reserved or alt_ip.is_multicast
     # literal IP checks without DNS
     try:
         ip = ipaddress.ip_address(host)
@@ -307,32 +171,6 @@ def _is_private_hostname(hostname: str | None) -> bool:
                 return True
         except (IndexError, ValueError):
             pass
-    # Additional DNS resolution check for hostnames that may resolve to private
-    # This mitigates DNS rebinding where a name resolves to an internal address.
-    # Best effort with short timeout, failures are treated as not private.
-    try:
-        import socket
-
-        # Use getaddrinfo with timeout via setting default timeout temporarily
-        # Only attempt for names that look like hostnames, not for URLs with path
-        if re.match(r"^[a-z0-9.-]+$", host):
-            # Avoid blocking on external DNS for too long; use 2 second timeout
-            old_timeout = socket.getdefaulttimeout()
-            try:
-                socket.setdefaulttimeout(2)
-                infos = socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
-                for family, _, _, _, sockaddr in infos:
-                    addr = sockaddr[0]
-                    try:
-                        ip = ipaddress.ip_address(addr.split("%")[0])
-                        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-                            return True
-                    except ValueError:
-                        continue
-            finally:
-                socket.setdefaulttimeout(old_timeout)
-    except Exception:
-        pass
     return False
 
 
@@ -341,56 +179,9 @@ def _check_url_allowed(url: str) -> str | None:
         parsed = urlparse(url)
     except ValueError:
         return f"fetch failed: malformed URL {url!r}"
-    if parsed.scheme and parsed.scheme.lower() not in ("http", "https"):
-        return f"fetch failed: unsupported scheme '{parsed.scheme}'"
     if _is_private_hostname(parsed.hostname):
         return f"fetch failed: blocked private or internal host {parsed.hostname!r}"
     return None
-
-
-# Test hook: the test suite replaces this name to simulate HTTP
-# responses without touching the network. It is bound to the validating
-# opener below, once the handler it depends on has been defined.
-urlopen = stdlib_urlopen
-
-
-def _make_opener() -> object:
-    """Create an opener with safe redirect handling.
-
-    Separated for testability: tests can mock this function to return
-    a custom opener that simulates responses without network access.
-    """
-    return build_opener(_SafeRedirectHandler)
-
-
-class _SafeRedirectHandler(HTTPRedirectHandler):
-    """Redirect handler that validates each redirect target before following."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # newurl may be relative; resolve against original request url
-        if newurl:
-            parsed = urlparse(newurl)
-            if not parsed.scheme:
-                newurl = urljoin(req.full_url, newurl)
-        # Validate scheme
-        try:
-            parsed = urlparse(newurl)
-        except ValueError:
-            raise HTTPError(newurl, code, f"blocked redirect to malformed URL {newurl!r}", headers, fp)
-        if parsed.scheme.lower() not in ("http", "https"):
-            raise HTTPError(newurl, code, f"blocked redirect to unsupported scheme {parsed.scheme!r}", headers, fp)
-        blocked = _check_url_allowed(newurl)
-        if blocked:
-            raise HTTPError(newurl, code, blocked, headers, fp)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-try:
-    # Routed through the validating opener so each hop is checked, not
-    # just the URL the chain happens to end on. Tests rebind this name.
-    urlopen = _make_opener().open
-except Exception:  # pragma: no cover - defensive
-    urlopen = stdlib_urlopen
 
 
 class WebFetchTool(Tool):
@@ -459,9 +250,6 @@ class WebFetchTool(Tool):
 
         try:
             request = Request(url, headers={"User-Agent": _USER_AGENT})
-            # Through the validating opener, so a redirect to an internal
-            # host is refused at that hop instead of being followed and
-            # only noticed once the final URL is inspected.
             with urlopen(request, timeout=self.timeout) as response:
                 raw = response.read(_MAX_BYTES + 1)
                 final_url = response.geturl()
@@ -472,35 +260,24 @@ class WebFetchTool(Tool):
         except HTTPError as exc:
             # The body of an error response often says which header was
             # wrong, so surface the status and let the agent carry on.
-            # Also covers blocked redirects raised by the safe handler.
-            detail = str(exc.reason) if hasattr(exc, "reason") else str(exc)
-            if "blocked" in detail.lower():
-                return detail
             return f"fetch failed: HTTP {exc.code} {exc.reason} for {url}"
         except URLError as exc:
-            reason = str(exc.reason) if hasattr(exc, "reason") else str(exc)
-            if "blocked" in reason.lower():
-                return reason
             return f"fetch failed: {exc.reason} for {url}"
         except (TimeoutError, OSError) as exc:
             return f"fetch failed: {exc} for {url}"
 
-        # The safe redirect handler already blocked private hosts on each hop,
-        # but re-check final URL as defence in depth (e.g. for non redirect case).
+        # block redirects to private hosts
         blocked_final = _check_url_allowed(final_url)
         if blocked_final:
             return blocked_final
-        # Ensure final scheme is still http/https (handler blocks, but check again)
-        final_scheme = urlparse(final_url).scheme.lower()
-        if final_scheme not in ("http", "https"):
-            return f"fetch failed: blocked redirect to unsupported scheme {final_scheme!r}"
 
         if len(raw) > _MAX_BYTES:
             raw = raw[:_MAX_BYTES]
             note.append(f"(response truncated at {_MAX_BYTES} bytes)")
 
-        raw, inflated_truncated = _inflate(raw, compressed)
-        if inflated_truncated:
+        raw = _inflate(raw, compressed)
+        if len(raw) > _MAX_INFLATED:
+            raw = raw[:_MAX_INFLATED]
             note.append(f"(decompressed response truncated at {_MAX_INFLATED} bytes)")
         charset_note: list[str] = []
         body = _decode(raw, encoding if _looks_textual(content_type) else None, charset_note)

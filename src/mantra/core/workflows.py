@@ -86,28 +86,8 @@ def _save_all(data: dict[str, Any]) -> bool:
     target = workflows_path()
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(target.parent, 0o700)
-        except OSError:
-            pass
-        content = json.dumps(data, ensure_ascii=False, indent=2)
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        try:
-            with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(content)
-            try:
-                os.chmod(tmp, 0o600)
-            except OSError:
-                pass
-            tmp.replace(target)
-        except OSError:
-            # Fallback
-            with open(target, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(content)
-            try:
-                os.chmod(target, 0o600)
-            except OSError:
-                pass
+        with open(target, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
     except OSError:
         return False
     return True

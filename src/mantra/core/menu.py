@@ -26,9 +26,27 @@ from typing import Any, Iterable, Sequence
 _CURSOR_REPORT = re.compile(r"\033\[(\d+);(\d+)R")
 
 
-# Re-exported: the console's secret reader imports it from here. The
-# implementation now lives in one module shared by every interactive part.
-from mantra.term import raw_mode, visible_len  # noqa: F401
+@contextmanager
+def raw_mode():
+    """Single-key input for the duration of the block.
+
+    Shared by the menu and by the secret reader, both of which need to
+    react to one keystroke at a time. A no-op on Windows, where
+    ``msvcrt`` reads a key without any mode change.
+    """
+    if os.name == "nt":
+        yield
+        return
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    original = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
 
 # ANSI: enable mouse click reporting and the SGR coordinate format that
 # reports positions larger than 223 cells.
@@ -43,12 +61,13 @@ KEY_ENTER = "key:enter"
 KEY_CANCEL = "key:cancel"
 KEY_BACKSPACE = "key:backspace"
 KEY_MOUSE = "key:mouse"
-KEY_PAGE_DOWN = "key:page-down"
 
 _ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
 
 
-
+def visible_len(text: str) -> int:
+    """Printed width of ``text``, ignoring colour escapes."""
+    return len(_ANSI_RE.sub("", text))
 
 
 @dataclass
@@ -179,9 +198,6 @@ class Menu:
         if key == KEY_BACKSPACE:
             self.query = self.query[:-1]
             self.cursor = 0
-            return None
-        if key == KEY_PAGE_DOWN:
-            self.cursor = min(len(matches) - 1, self.cursor + self.max_rows)
             return None
         if key == KEY_ENTER:
             if not matches or self.cursor >= len(matches):
@@ -364,8 +380,19 @@ class Menu:
 
     @contextmanager
     def _raw_mode(self):
-        with raw_mode():
+        if os.name == "nt":
             yield
+            return
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        original = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            yield
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, original)
 
     def _input_pending(self) -> bool:
         """True when more bytes are already buffered on stdin."""
@@ -413,10 +440,7 @@ class Menu:
             return KEY_CANCEL
         if char in ("\x7f", "\b"):
             return KEY_BACKSPACE
-        if char == " ":
-            # Space pages forward in menus (PageDown equivalent). Filter
-            # typing uses space via _handle, but _read_key is tested
-            # directly so handle paging here as well.
+        if char == " ":  # space and PageDown page forward
             self.cursor = min(len(self.matches) - 1, self.cursor + self.max_rows)
             return None
         if not self._input_pending():
@@ -471,8 +495,6 @@ class Menu:
             return KEY_UP
         if body == "B":
             return KEY_DOWN
-        if body == "6~":
-            return KEY_PAGE_DOWN
         return None
 
     def _classify(self, text: str):

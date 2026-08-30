@@ -32,8 +32,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
-import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -70,96 +68,25 @@ def settings_path() -> Path:
     return Path.home() / ".mantra" / "config.json"
 
 
-# Set when the file could not be parsed. Nothing writes over a document
-# it failed to understand until that document has been copied aside.
-_last_error: str | None = None
-
-# A lock this old belonged to a process that is gone.
-_LOCK_STALE_SECONDS = 5.0
-
-
-def last_error() -> str | None:
-    """Why the settings file could not be read, or None when it could.
-
-    The console reads this once at startup, because continuing silently
-    on defaults looks exactly like "you have no endpoints" and sends the
-    operator off to re-enter everything they already had.
-    """
-    return _last_error
-
-
 def _read() -> dict[str, Any]:
-    """The raw document. Records a parse failure instead of hiding it."""
-    global _last_error
     file = path()
     if not file.is_file():
-        _last_error = None
         return {}
     try:
         data = json.loads(file.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+    except (OSError, json.JSONDecodeError):
         # A file the user is editing by hand will be broken sometimes.
-        # Starting empty is fine; silently overwriting what we could not
-        # read is not, so the failure is remembered for _write.
-        _last_error = f"{file} could not be parsed: {exc}"
+        # Losing their settings silently is worse than starting empty,
+        # but crashing at startup is worst of all.
         return {}
-    except OSError as exc:
-        _last_error = f"{file} could not be read: {exc}"
-        return {}
-    _last_error = None
     return data if isinstance(data, dict) else {}
-
-
-def _quarantine(file: Path, reason: str) -> str | None:
-    """Copy an unreadable file aside before anything replaces it.
-
-    Returns the backup path, or None when there was nothing to save.
-    """
-    if not file.is_file():
-        return None
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = file.with_suffix(file.suffix + f".corrupt-{stamp}")
-    try:
-        shutil.copy2(file, backup)
-        return str(backup)
-    except OSError:
-        # Nothing more can be done; the caller still has to decide.
-        return None
 
 
 def _write(data: dict[str, Any]) -> None:
     file = path()
     file.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(file.parent, 0o700)
-    except OSError:
-        pass
-    # The document was handed to the user to edit by hand, so it will be
-    # broken sometimes. Writing empty defaults over a file we could not
-    # parse turned one stray comma into the loss of every endpoint.
-    if _last_error is not None:
-        _quarantine(file, _last_error)
     data["version"] = _VERSION
-    content = json.dumps(data, indent=2, sort_keys=True) + "\n"
-    # Atomic write via temporary file to avoid corruption on interruption
-    tmp = file.with_suffix(file.suffix + ".tmp")
-    try:
-        tmp.write_text(content, encoding="utf-8")
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        tmp.replace(file)
-    except OSError:
-        # Fallback to direct write if atomic fails
-        try:
-            file.write_text(content, encoding="utf-8")
-            try:
-                os.chmod(file, 0o600)
-            except OSError:
-                pass
-        except OSError:
-            pass
+    file.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def load() -> dict[str, Any]:

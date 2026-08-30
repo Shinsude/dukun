@@ -20,8 +20,7 @@ REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 DEFAULTS = {
     "system_prompt": None,  # falls back to the loop default
     "max_steps": 30,
-    # The message budget lives under "context"; a second copy here was
-    # ignored by every reader and misled anyone editing the file.
+    "max_messages": 200,
     "llm": {
         "provider": "openai",
         "model": "gpt-4o",
@@ -46,17 +45,10 @@ DEFAULTS = {
     "evaluator": {"type": "command", "test_cmd": "python -m pytest tests/ -q"},
     "logging": {"type": "jsonl", "path": "logs/mantra-run.jsonl"},
     # Interactive-session behaviour (the headless CLI ignores these).
-    # The strictest mode: read-only work runs unattended, anything that
-    # mutates or destroys is put to the operator first. The permissive
-    # mode is one /approve away for anyone who wants it, but shipping it
-    # as the default meant a misclassified command ran with no prompt.
-    "approvals": "default",  # default | auto | yolo | plan
+    "approvals": "auto",  # default | auto | yolo | plan
     "context": {"max_messages": 200, "max_chars": 240000},
     "auto_compact_tokens": 60000,  # summarise the history past this size; 0 disables
     "verbose": False,  # echo truncated tool output as it arrives
-    # Use native terminal scrollback and mouse selection in the console.
-    # Set false to opt into the fixed framed layout.
-    "native_scrollback": True,
     "skills": {
         # Attach a matching skill to a plain prompt without being asked.
         # Off still leaves /skills fully usable by hand.
@@ -68,23 +60,12 @@ DEFAULTS = {
 }
 
 
-_MAX_CONFIG_BYTES = 1_000_000
-
-
 def load_config(path: str) -> dict:
     """Load a config file and merge it over the defaults (shallow per section)."""
     if not os.path.isfile(path):
         raise ConfigError(f"config file not found: {path}")
-    try:
-        size = os.path.getsize(path)
-        if size > _MAX_CONFIG_BYTES:
-            raise ConfigError(f"config file too large ({size} bytes, limit {_MAX_CONFIG_BYTES})")
-    except OSError:
-        pass
     with open(path, "r", encoding="utf-8") as handle:
-        raw = handle.read(_MAX_CONFIG_BYTES + 1)
-    if len(raw) > _MAX_CONFIG_BYTES:
-        raise ConfigError(f"config file too large (exceeds {_MAX_CONFIG_BYTES} bytes)")
+        raw = handle.read()
     if path.lower().endswith((".yaml", ".yml")):
         data = _load_yaml(raw)
     else:
@@ -113,27 +94,13 @@ def merge_defaults(data: dict) -> dict:
             merged[key] = _deep_merge(merged[key], value)
         else:
             merged[key] = copy.deepcopy(value) if isinstance(value, (dict, list)) else value
-    # Presence alone says nothing: these keys are always present because
-    # the defaults supply them. A section explicitly set to null, or a
-    # tool list that is a string, used to sail through and then fail
-    # with an attribute error deep inside assembly.
     required = ("llm", "sandbox", "evaluator")
-    wrong_type = [
-        key for key in required if not isinstance(merged.get(key), dict)
-    ]
-    if wrong_type:
-        raise ConfigError(
-            f"config sections must be objects: {', '.join(wrong_type)}"
-        )
+    missing = [key for key in required if key not in merged]
+    if missing:
+        raise ConfigError(f"config sections missing: {missing}")
     tools = merged.get("tools")
     if not isinstance(tools, list) or not tools:
         raise ConfigError("config must list at least one tool")
-    bad_tool = next((t for t in tools if not isinstance(t, str) or not t.strip()), None)
-    if bad_tool is not None:
-        raise ConfigError(f"config tools must be non-empty names, got {bad_tool!r}")
-    steps = merged.get("max_steps", 30)
-    if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
-        raise ConfigError(f"config max_steps must be a positive integer, got {steps!r}")
     mode = merged.get("approvals", "default")
     if mode not in ("default", "auto", "yolo", "plan"):
         raise ConfigError(

@@ -1,14 +1,11 @@
 """Terminal user interface: a persistent frame with live session state.
 
-The interface is four fixed regions and one scrolling one::
+The interface is three fixed regions and one scrolling one::
 
     row 1      identity      name · version            endpoint · model
     row 2      context       workspace · git           skills · goal
-    row 3      ────────────────────────────────────────────────────────
-    rows 4..   conversation  scrolls; the only region that moves
-    row R-3    ────────────────────────────────────────────────────────
-    row R-2    status        approval mode · turns · context · cache
-    row R-1    prompt        what the operator is typing
+    rows 3..   conversation  scrolls; the only region that moves
+    row R-1    prompt        > prefix + status (right-aligned)
 
 The previous design had no header at all and a status line carrying only
 the model and workspace. Everything a session is actually *doing* - which
@@ -47,11 +44,10 @@ MIN_CONTENT_ROWS = 4
 
 # Region offsets, counted from the top and the bottom respectively.
 _HEADER_ROWS = 2
-_TOP_RULE_ROW = 3
-_CONTENT_TOP = 4
+_CONTENT_TOP = 3
 
-# Counted back from the last row: prompt, status, rule, one spare.
-_ROWS_FROM_BOTTOM = 4
+# Counted back from the last row: prompt, border, content.
+_ROWS_FROM_BOTTOM = 2
 
 _SEPARATOR = "─"
 
@@ -197,9 +193,10 @@ def _version() -> str:
 
 def _identity(session: Any, style: Any) -> tuple[str, str]:
     """Left and right of the top header row."""
-    bright_green = _style_fn(style, "bright_green")
+    bright_cyan = _style_fn(style, "bright_cyan")
     dim = _style_fn(style, "dim")
-    left = f"{bright_green('MANTRA')} {dim(_version())}"
+    bright_white = _style_fn(style, "bright_white")
+    left = f"{bright_cyan('MANTRA')} {dim(_version())}"
     cfg = getattr(session, "config", None)
     if not isinstance(cfg, dict):
         cfg = {}
@@ -213,7 +210,7 @@ def _identity(session: Any, style: Any) -> tuple[str, str]:
         endpoint = _display(session.endpoint_name or "")
     except Exception:
         endpoint = ""
-    right_bits = [b for b in (endpoint, f"{model} {dim('(' + effort + ')')}") if b]
+    right_bits = [b for b in (endpoint, f"{bright_white(model)} {dim('(' + effort + ')')}") if b]
     return left, " · ".join(right_bits)
 
 
@@ -226,7 +223,8 @@ def _context(session: Any, style: Any) -> tuple[str, str]:
         short = ""
     git = _display(getattr(session, "git_state", "") or "")
     dim = _style_fn(style, "dim")
-    left = short + (f" {dim(git)}" if git else "")
+    bright_green = _style_fn(style, "bright_green")
+    left = f"{bright_green(short)}" + (f" {dim(git)}" if git else "")
 
     right_bits = []
     skills = getattr(session, "active_skills", None)
@@ -270,6 +268,34 @@ def render_header(session: Any, style: Any, cols: int) -> list[str]:
 
 def render_status(session: Any, style: Any, cols: int) -> str:
     """One line of live session state."""
+    dim = _style_fn(style, "dim")
+    bright_white = _style_fn(style, "bright_white")
+    bright_cyan = _style_fn(style, "bright_cyan")
+    
+    # Get model name from session config
+    model_name = ""
+    cfg = getattr(session, "config", None)
+    if isinstance(cfg, dict):
+        llm = cfg.get("llm")
+        if isinstance(llm, dict):
+            model_name = _display(llm.get("model"), "")
+    
+    # Get reasoning effort
+    effort = ""
+    if isinstance(cfg, dict):
+        llm = cfg.get("llm")
+        if isinstance(llm, dict):
+            effort = _display(llm.get("reasoning_effort"), "")
+    
+    # Build model display like Grok: "model-name (effort)"
+    model_display = ""
+    if model_name:
+        if effort:
+            model_display = f"{bright_cyan(model_name)} {dim('(' + effort + ')')}"
+        else:
+            model_display = bright_cyan(model_name)
+    
+    # Get approval mode
     mode = getattr(getattr(session, "approvals", None), "mode", "default")
     if not isinstance(mode, str) or mode not in _MODE_STYLES:
         if isinstance(mode, str) and mode not in _MODE_STYLES:
@@ -277,8 +303,11 @@ def render_status(session: Any, style: Any, cols: int) -> str:
         mode = "default"
     marker, colour_name = _MODE_STYLES.get(mode, ("●", "green"))
     colour = _style_fn(style, colour_name)
-    dim = _style_fn(style, "dim")
-    parts = [f"{colour(marker)} {_display(mode, 'default')}"]
+    
+    parts = []
+    if model_display:
+        parts.append(model_display)
+    parts.append(f"{colour(marker)} {_display(mode, 'default')}")
 
     totals = getattr(session, "totals", None)
     if not isinstance(totals, dict):
@@ -313,41 +342,80 @@ def render_status(session: Any, style: Any, cols: int) -> str:
             rate = 0
         parts.append(dim(f"{rate}% cached"))
 
-    try:
-        errors = int(totals.get("tool_errors", 0) or 0)
-    except (TypeError, ValueError) as exc:
-        _log.debug("totals.tool_errors not numeric: %r", exc)
-        errors = 0
-    if errors:
-        parts.append(_style_fn(style, "yellow")(f"{errors} err"))
+    # Tool call count, time, and errors from current turn
+    tool_count = getattr(session, "_tool_call_count", 0)
+    tool_total = getattr(session, "_tool_total_time", 0.0)
+    tool_ok = getattr(session, "_tool_success_count", 0)
+    tool_fail = getattr(session, "_tool_fail_count", 0)
+    if tool_count:
+        # Format total time prominently
+        if tool_total < 0.001:
+            time_str = "0ms"
+        elif tool_total < 1:
+            time_str = f"{int(tool_total * 1000)}ms"
+        elif tool_total < 60:
+            time_str = f"{tool_total:.1f}s"
+        else:
+            minutes = int(tool_total) // 60
+            seconds = tool_total % 60
+            time_str = f"{minutes}m{seconds:02d}s"
+        # Build tool status: count · time · errors
+        tool_str = f"{tool_count} tool"
+        time_part = _style_fn(style, "bright_white")(time_str)
+        # Color based on errors
+        if tool_fail == 0:
+            rate_str = f"{tool_str} {time_part}"
+            rate_str = _style_fn(style, "green")(rate_str)
+        else:
+            err_str = _style_fn(style, "red")(f"{tool_fail} err")
+            rate_str = f"{tool_str} {time_part} {err_str}"
+            rate_str = _style_fn(style, "yellow")(tool_str) + " " + time_part + " " + err_str
+        parts.append(rate_str)
 
-    try:
-        streamed = int(getattr(session, "_stream_tokens", 0) or 0)
-    except (TypeError, ValueError) as exc:
-        _log.debug("stream_tokens not numeric: %r", exc)
-        streamed = 0
-    if streamed:
-        parts.append(_style_fn(style, "bright_yellow")(f"~{_short_count(streamed)} tok"))
+    # Token usage breakdown with cost
+    tokens_in = getattr(session, "_tokens_input", 0)
+    tokens_out = getattr(session, "_tokens_output", 0)
+    tokens_cached = getattr(session, "_tokens_cached", 0)
+    tokens_cost = getattr(session, "_tokens_cost", 0.0)
+    if tokens_in or tokens_out:
+        # Format: in/out with cache percentage
+        cache_pct = int(tokens_cached * 100 / tokens_in) if tokens_in > 0 else 0
+        token_str = f"{_short_count(tokens_in)}↑ {_short_count(tokens_out)}↓"
+        if cache_pct > 0:
+            token_str += f" {cache_pct}%♻"
+        # Add cost estimate
+        if tokens_cost > 0:
+            if tokens_cost < 0.01:
+                cost_str = f"${tokens_cost * 100:.1f}¢"
+            else:
+                cost_str = f"${tokens_cost:.2f}"
+            token_str += f" {cost_str}"
+        parts.append(_style_fn(style, "cyan")(token_str))
+    else:
+        # Fallback: show streaming tokens
+        try:
+            streamed = int(getattr(session, "_stream_tokens", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            _log.debug("stream_tokens not numeric: %r", exc)
+            streamed = 0
+        if streamed:
+            parts.append(_style_fn(style, "bright_yellow")(f"~{_short_count(streamed)} tok"))
 
     return _shorten("  ".join(parts), cols)
 
 
 def render_card(session: Any = None, style: Any = None, width: int | None = None) -> list[str]:
-    """The startup card: a bordered box rather than three floating lines."""
-    cols, _ = terminal_size()
-    inner = width or min(48, max(28, cols - 8))
-    if inner % 2 == 1:
-        inner -= 1
-    body = max(4, inner - 2)
-    title = _style_fn(style, "bold")(_style_fn(style, "bright_white")("M A N T R A"))
-    tagline = _style_fn(style, "dim")("Spells Matter")
-    version = _style_fn(style, "dim")(_version())
+    """The startup card: clean text."""
+    bold = _style_fn(style, "bold")
+    bright_cyan = _style_fn(style, "bright_cyan")
+    dim = _style_fn(style, "dim")
+    
     lines = [
-        "┌" + "─" * body + "┐",
-        "│" + _fit(title, body) + "│",
-        "│" + _fit(tagline, body) + "│",
-        "│" + _fit(version, body) + "│",
-        "└" + "─" * body + "┘",
+        "",
+        f"  {bold(bright_cyan('M A N T R A'))}",
+        f"  {dim('Spells Matter')}",
+        f"  {dim(_version())}",
+        "",
     ]
     return lines
 
@@ -362,8 +430,8 @@ class Layout:
         self.active = False
         self.content_top = 1
         self.content_bottom = 1
+        self.border_row = 1
         self.prompt_row = 1
-        self.status_row = 1
         self._cols = 0
         self._rows = 0
         self._session: Any = None
@@ -379,6 +447,10 @@ class Layout:
             self._session = session
             self._style = style
             cols, rows = terminal_size()
+            # Enter alternate screen buffer and clear it
+            _write("\033[?1049h")
+            _write("\033[2J\033[H")
+            sys.stdout.flush()
             self._resize_locked(cols, rows)
             if not self.active:
                 return False
@@ -394,8 +466,11 @@ class Layout:
                 _log.debug("cleanup reset region failed: %r", exc)
             self._disable_mouse_locked()
             try:
+                _write("\033[0 q")  # Reset cursor to default
                 if self._rows > 0:
                     _write(f"\033[{self._rows};1H\n")
+                # Leave alternate screen buffer
+                _write("\033[?1049l")
                 sys.stdout.flush()
             except Exception as exc:
                 _log.debug("cleanup flush failed: %r", exc)
@@ -410,9 +485,9 @@ class Layout:
     def _resize_locked(self, cols: int, rows: int) -> None:
         self._cols, self._rows = cols, rows
         self.content_top = _CONTENT_TOP
-        self.content_bottom = max(_CONTENT_TOP, rows - _ROWS_FROM_BOTTOM)
-        self.status_row = max(1, rows - 2)
         self.prompt_row = max(1, rows - 1)
+        self.border_row = max(1, rows - 2)
+        self.content_bottom = max(_CONTENT_TOP, rows - _ROWS_FROM_BOTTOM - 1)
         content_rows = self.content_bottom - self.content_top + 1
         self.active = fits(cols, rows) and content_rows >= MIN_CONTENT_ROWS
         if self.active:
@@ -425,7 +500,8 @@ class Layout:
     def _apply_region_locked(self) -> None:
         try:
             _write(f"\033[{self.content_top};{self.content_bottom}r")
-            _write(f"\033[{self.content_top};1H")
+            # Move cursor inside scroll region, NOT to the prompt row
+            _write(f"\033[{self.content_bottom};1H")
             sys.stdout.flush()
         except Exception as exc:
             _log.debug("apply region failed: %r", exc)
@@ -436,6 +512,9 @@ class Layout:
         if cols == self._cols and rows == self._rows:
             return False
         with _lock:
+            # Save OLD positions BEFORE recalculating
+            old_border = self.border_row
+            old_prompt = self.prompt_row
             was_active = self.active
             try:
                 _write("\033[r")
@@ -449,17 +528,18 @@ class Layout:
                     self._clear_locked()
                     self._splash_visible = False
                 return True
-            if not was_active:
-                self._clear_locked()
-            else:
-                # Remains active but geometry changed — clear content area
-                # so old lines outside new region do not linger
-                try:
-                    for row in range(self.content_top, self.content_bottom + 1):
-                        _write(f"\033[{row};1H\033[2K")
-                    sys.stdout.flush()
-                except Exception as exc:
-                    _log.debug("resize content clear failed: %r", exc)
+            # Clear old prompt row and new bottom row to prevent duplication
+            try:
+                _write(f"\033[{old_prompt};1H\033[2K")
+                _write(f"\033[{rows};1H\033[2K")
+                sys.stdout.flush()
+            except Exception as exc:
+                _log.debug("clear prompt rows failed: %r", exc)
+            # Full clear — wipe entire screen so no ghosts remain
+            self._clear_locked()
+            # Restore scroll region (clear wiped it)
+            if self.active:
+                self._apply_region_locked()
             self.draw_chrome_locked()
             return True
 
@@ -482,7 +562,7 @@ class Layout:
             self.draw_chrome_locked()
 
     def draw_chrome_locked(self) -> None:
-        """Header, rules and status - caller must hold _lock."""
+        """Header, border and status - caller must hold _lock."""
         if not self.active or self._session is None:
             return
         style = self._style
@@ -492,37 +572,43 @@ class Layout:
             _write("\033[r")  # address the whole screen first
             for index, line in enumerate(render_header(self._session, style, cols)):
                 _write(f"\033[{index + 1};1H\033[2K{line}")
-            _write(f"\033[{_TOP_RULE_ROW};1H\033[2K{dim(_rule(cols))}")
-            _write(f"\033[{self._rows - 3};1H\033[2K{dim(_rule(cols))}")
-            self._write_status_locked()
+            # Draw subtle border line above prompt
+            bright_cyan = _style_fn(style, "bright_cyan")
+            _write(f"\033[{self.border_row};1H\033[2K{bright_cyan(_rule(cols))}")
             sys.stdout.flush()
         except Exception as exc:
             _log.debug("draw_chrome failed: %r", exc)
         finally:
             self._apply_region_locked()
 
-    def _write_status_locked(self) -> None:
-        """Write status line assuming _lock is held and region is full-screen."""
-        try:
-            _write(
-                f"\033[{self.status_row};1H\033[2K"
-                f"{render_status(self._session, self._style, self._cols)}"
-            )
-        except Exception as exc:
-            _log.debug("write status failed: %r", exc)
-
-    def draw_status(self) -> None:
-        """Repaint just the status line - cheap enough to call every turn."""
+    def draw_border_status(self, text: str = "") -> None:
+        """Show tool call status in the border line."""
         if not self.active or self._session is None:
             return
         with _lock:
+            style = self._style
+            cols = self._cols
+            dim = _style_fn(style, "dim")
+            bright_cyan = _style_fn(style, "bright_cyan")
             try:
-                _write("\033[s")
-                self._write_status_locked()
-                _write("\033[u")
+                _write("\033[r")  # address whole screen
+                if text:
+                    # Show tool status in the border line
+                    truncated = _shorten(text, max(0, cols - 4))
+                    border = f" {bright_cyan(truncated)} "
+                    # Pad to fill the line
+                    pad = max(0, cols - visible_len(border))
+                    left_pad = pad // 2
+                    right_pad = pad - left_pad
+                    _write(f"\033[{self.border_row};1H\033[2K{dim('─' * left_pad)}{border}{dim('─' * right_pad)}")
+                else:
+                    # Restore normal border
+                    _write(f"\033[{self.border_row};1H\033[2K{bright_cyan(_rule(cols))}")
                 sys.stdout.flush()
             except Exception as exc:
-                _log.debug("draw_status failed: %r", exc)
+                _log.debug("draw_border_status failed: %r", exc)
+            finally:
+                self._apply_region_locked()
 
     # ---- splash ------------------------------------------------------
 
@@ -534,13 +620,16 @@ class Layout:
         with _lock:
             try:
                 _write("\033[r")
+                # Center vertically in content area
+                available_rows = self.content_bottom - self.content_top + 1
+                vertical_pad = max(0, (available_rows - len(card)) // 2)
                 for offset, line in enumerate(card):
-                    row = self.content_top + offset
+                    row = self.content_top + vertical_pad + offset
                     if row > self.content_bottom:
                         break
                     pad = max(0, (self._cols - visible_len(line)) // 2)
                     _write(f"\033[{row};1H\033[2K{' ' * pad}{line}")
-                _write(f"\033[{min(self.content_bottom, self.content_top + len(card) + 1)};1H")
+                _write(f"\033[{min(self.content_bottom, self.content_top + vertical_pad + len(card) + 1)};1H")
                 sys.stdout.flush()
             except Exception as exc:
                 _log.debug("show_splash failed: %r", exc)
@@ -569,28 +658,9 @@ class Layout:
     def move_to_content(self) -> None:
         if self.active:
             with _lock:
+                # Move to bottom of content area - scroll region scrolls upward when full
                 _write(f"\033[{self.content_bottom};1H")
                 sys.stdout.flush()
-
-    def move_to_prompt(self) -> None:
-        if not self.active:
-            return
-        with _lock:
-            self.draw_status_locked_inline()
-            _write(f"\033[{self.prompt_row};1H\033[2K")
-            sys.stdout.flush()
-
-    def draw_status_locked_inline(self) -> None:
-        """Status repaint without re-acquiring _lock (caller already holds it)."""
-        if not self.active or self._session is None:
-            return
-        try:
-            _write("\033[s")
-            self._write_status_locked()
-            _write("\033[u")
-            sys.stdout.flush()
-        except Exception as exc:
-            _log.debug("draw_status_locked_inline failed: %r", exc)
 
     def move_to_header(self) -> None:
         if self.active:
@@ -640,13 +710,6 @@ class Layout:
 # ------------------------------------------------------------------ helpers
 
 
-def draw_status(session: Any, style: Any) -> None:
-    """Repaint the status line of the session's current layout."""
-    layout = getattr(session, "layout", None)
-    if layout is not None and layout.active:
-        layout.draw_status()
-
-
 def show_splash(session: Any, style: Any) -> int:
     """Draw the startup card. Returns how many rows it took."""
     layout = getattr(session, "layout", None)
@@ -658,21 +721,15 @@ def show_splash(session: Any, style: Any) -> int:
 def render_welcome(session: Any, style: Any, cols: int, rows: int) -> list[str]:
     """Create the MANTRA welcome panel used by native scrollback mode."""
     dim = _style_fn(style, "dim")
-    bright = _style_fn(style, "bright_green")
+    bright_cyan = _style_fn(style, "bright_cyan")
     bold = _style_fn(style, "bold")
-    width = min(_WELCOME_WIDTH, max(36, cols - 8))
-    body = max(20, width - 2)
-    title = f"{bold(bright('MANTRA'))}  {dim('workspace intelligence') }"
+    
     lines = [
-        "┌" + "─" * body + "┐",
-        "│" + _fit(title, body) + "│",
-        "│" + _fit(dim("Explore  ·  Build  ·  Verify"), body) + "│",
-        "│" + " " * body + "│",
-        "│" + _fit(dim("A focused coding workspace for deliberate changes."), body) + "│",
-        "│" + _fit(dim("Type a request, or /help for commands."), body) + "│",
-        "│" + " " * body + "│",
-        "│" + _fit(dim("Native scrollback enabled  ·  mouse selection available"), body) + "│",
-        "└" + "─" * body + "┘",
+        "",
+        f"  {bold(bright_cyan('M A N T R A'))}",
+        f"  {dim('Spells Matter')}",
+        f"  {dim(_version())}",
+        "",
     ]
     return lines
 

@@ -155,28 +155,14 @@ def load_skill(directory: Path) -> Skill | None:
     )
 
 
-_CACHE_TTL = 1.5
-_cache_all: dict[str, Skill] | None = None
-_cache_all_ts: float = 0.0
-_cache_all_roots: tuple[str, ...] | None = None
-
-
 def load_all() -> dict[str, Skill]:
     """Every skill, keyed by lowercase name.
 
     Earlier roots win on a name collision, so a personal skills
     directory can shadow a project one. A directory without SKILL.md is
     skipped silently - skills/ legitimately holds INDEX.md and other
-    documentation. Results are cached briefly to avoid scanning on every
-    turn.
+    documentation.
     """
-    global _cache_all, _cache_all_ts, _cache_all_roots
-    import time
-
-    current_roots = tuple(str(r) for r in roots())
-    now = time.monotonic()
-    if _cache_all is not None and _cache_all_roots == current_roots and (now - _cache_all_ts) < _CACHE_TTL:
-        return dict(_cache_all)
     found: dict[str, Skill] = {}
     for root in roots():
         if not root.is_dir():
@@ -192,30 +178,7 @@ def load_all() -> dict[str, Skill]:
             key = skill.name.lower()
             if key not in found:
                 found[key] = skill
-    _cache_all = dict(found)
-    _cache_all_ts = now
-    _cache_all_roots = current_roots
     return found
-
-
-def invalidate_cache() -> None:
-    """Forget everything indexed so far.
-
-    Skill directories are files on disk, but the index is held for a
-    moment to avoid rescanning on every turn. After an edit, that moment
-    is exactly when the operator wants to see the change, so the console
-    exposes a way to drop it.
-    """
-    global _cache_all, _cache_all_ts, _cache_all_roots, _cache_bundles, _cache_bundles_ts, _cache_bundles_roots, _cache_routing, _cache_routing_ts, _cache_routing_roots
-    _cache_all = None
-    _cache_all_ts = 0.0
-    _cache_all_roots = None
-    _cache_bundles = None
-    _cache_bundles_ts = 0.0
-    _cache_bundles_roots = None
-    _cache_routing = None
-    _cache_routing_ts = 0.0
-    _cache_routing_roots = None
 
 
 def list_skills() -> list[Skill]:
@@ -252,24 +215,12 @@ def _backticked(cell: str) -> list[str]:
     return re.findall(r"`([^`]+)`", cell)
 
 
-_cache_bundles: dict[str, list[str]] | None = None
-_cache_bundles_ts: float = 0.0
-_cache_bundles_roots: tuple[str, ...] | None = None
-
-
 def load_bundles() -> dict[str, list[str]]:
     """Bundles from any BUNDLES.md in the roots, newest root last.
 
     A bundle is an *ordered* list of skill names; the order is the
     workflow. Returns {} when no root documents any.
     """
-    global _cache_bundles, _cache_bundles_ts, _cache_bundles_roots
-    import time
-
-    current_roots = tuple(str(r) for r in roots())
-    now = time.monotonic()
-    if _cache_bundles is not None and _cache_bundles_roots == current_roots and (now - _cache_bundles_ts) < _CACHE_TTL:
-        return dict(_cache_bundles)
     bundles: dict[str, list[str]] = {}
     for root in roots():
         if not root.is_dir():
@@ -284,9 +235,6 @@ def load_bundles() -> dict[str, list[str]]:
             skills = _backticked(cells[1])
             if name and skills:
                 bundles[name] = skills
-    _cache_bundles = dict(bundles)
-    _cache_bundles_ts = now
-    _cache_bundles_roots = current_roots
     return bundles
 
 
@@ -294,24 +242,12 @@ def get_bundle(name: str) -> list[str] | None:
     return load_bundles().get((name or "").strip().lower())
 
 
-_cache_routing: dict[str, dict[str, str]] | None = None
-_cache_routing_ts: float = 0.0
-_cache_routing_roots: tuple[str, ...] | None = None
-
-
 def routing_table() -> dict[str, dict[str, str]]:
     """The INDEX.md catalog: name -> {function, chained}.
 
     Used to answer "which skill do I want" without reading every file.
-    Empty when no root publishes an index. Cached briefly.
+    Empty when no root publishes an index.
     """
-    global _cache_routing, _cache_routing_ts, _cache_routing_roots
-    import time
-
-    current_roots = tuple(str(r) for r in roots())
-    now = time.monotonic()
-    if _cache_routing is not None and _cache_routing_roots == current_roots and (now - _cache_routing_ts) < _CACHE_TTL:
-        return dict(_cache_routing)
     table: dict[str, dict[str, str]] = {}
     for root in roots():
         if not root.is_dir():
@@ -329,9 +265,6 @@ def routing_table() -> dict[str, dict[str, str]]:
             if len(cells) > 2:
                 entry["chained"] = ", ".join(_backticked(cells[2]))
             table.setdefault(names[0].lower(), entry)
-    _cache_routing = dict(table)
-    _cache_routing_ts = now
-    _cache_routing_roots = current_roots
     return table
 
 
@@ -432,12 +365,7 @@ def route(query: str, limit: int = 5) -> list[tuple[Skill, float]]:
     if not wanted:
         return []
     index = routing_table()
-    # A skill marked not user-invocable is one the operator did not ask
-    # to be offered, so it is never attached on the router's own guess.
-    # It stays fully reachable by name.
-    known = [s for s in list_skills() if s.user_invocable]
-    if not known:
-        return []
+    known = list_skills()
     weights = _idf(known, index)
     scored: list[tuple[Skill, float]] = []
     for skill in known:

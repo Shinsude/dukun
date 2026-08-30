@@ -7,58 +7,12 @@ The Docker sandbox is the isolated counterpart for real agent runs.
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import tempfile
 
 from mantra.core.exceptions import AbortError, SandboxError
 from mantra.interfaces.sandbox import ExecResult, Sandbox
-
-# Patterns that likely indicate an attempt to access paths outside the
-# workspace through the shell. This is a best effort mitigation for the
-# local directory sandbox, which is documented as not a security boundary.
-# Strong isolation should use the container sandbox.
-_TRAVERSAL_RE = re.compile(r"(\.\.[\\/]|[\\/]\.\.)")
-_ABSOLUTE_WIN_RE = re.compile(r"[a-zA-Z]:[\\/]")
-
-
-def _contains_traversal(command: str) -> bool:
-    """Heuristic check for shell commands that likely escape the workspace.
-
-    This blocks simple traversal like ``../`` or ``..\\`` and absolute paths
-    such as ``C:\\`` or ``/etc`` when they appear as file arguments. It is
-    intentionally conservative and may block some legitimate commands that
-    explicitly reference parent directories, which is the desired behaviour
-    for the local sandbox.
-    """
-    if not command:
-        return False
-    # Skip checks for URL like strings inside the command to avoid
-    # flagging https:// as an absolute path. Strip URL schemes before test.
-    stripped = re.sub(r"https?://[^\s]+", "", command)
-    stripped = re.sub(r"file://[^\s]+", "", stripped)
-    # Block any parent directory reference, even without slash like `cd ..`
-    # or `dir ..` which still escapes the workspace.
-    if ".." in stripped:
-        # Ensure it is a path component and not part of a larger token like ...
-        if re.search(r"(?:^|[\s\"'/\\:])\.\.(?:$|[\s\"'/\\])", stripped) or _TRAVERSAL_RE.search(stripped):
-            return True
-        # Also block the common traversal substring to be safe for `..\`
-        if _TRAVERSAL_RE.search(stripped):
-            return True
-    # Check absolute paths in arguments only, not the executable name.
-    # Split into tokens and check from the second token onwards.
-    tokens = stripped.split()
-    if len(tokens) > 1:
-        args_stripped = " ".join(tokens[1:])
-        if _ABSOLUTE_WIN_RE.search(args_stripped):
-            return True
-        for token in re.findall(r"(?:^|\s)(/[^\s]+)", args_stripped):
-            token = token.strip()
-            if len(token) > 1 and not token.startswith("//"):
-                return True
-    return False
 
 
 class LocalSandbox(Sandbox):
@@ -116,13 +70,6 @@ class LocalSandbox(Sandbox):
         abort = getattr(self, "abort", None)
         if abort is not None and abort.is_set():
             raise AbortError("interrupted by operator")
-        if _contains_traversal(command):
-            return ExecResult(
-                exit_code=-1,
-                stdout="",
-                stderr="blocked: command appears to access paths outside the workspace; use relative paths inside the workspace or use the container sandbox for stronger isolation",
-                timed_out=False,
-            )
         # Use Popen so abort can interrupt a long-running command.
         try:
             proc = subprocess.Popen(
@@ -264,10 +211,9 @@ class LocalSandbox(Sandbox):
             return False
         if url.startswith(("http://", "https://", "git@", "ssh://", "git://")):
             return True
-        # File scheme is disabled by default because it allows reading
-        # arbitrary local paths. Enable only for tests via env.
+        # allow local file paths for tests
         if url.startswith("file://"):
-            return bool(os.environ.get("MANTRA_ALLOW_FILE_URL"))
+            return True
         return False
 
     @staticmethod

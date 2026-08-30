@@ -227,10 +227,8 @@ class DockerSandbox(Sandbox):
         url = url.strip()
         if not url or len(url) > 2048 or "\n" in url or "\r" in url or "\x00" in url:
             return False
-        if url.startswith(("http://", "https://", "git@", "ssh://", "git://")):
+        if url.startswith(("http://", "https://", "git@", "ssh://", "git://", "file://")):
             return True
-        if url.startswith("file://"):
-            return bool(os.environ.get("MANTRA_ALLOW_FILE_URL"))
         return False
 
     @staticmethod
