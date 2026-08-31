@@ -1,28 +1,4 @@
-"""Named sequences of prompts, run in order.
-
-A workflow is a list of steps. Launching one sends each step to the
-agent in turn, so a job that always takes the same shape - read the
-diff, run the tests, summarise what broke - can be fired once instead
-of typed three times.
-
-They live in one hand-editable file, ``~/.mantra/workflows.json``::
-
-    {
-      "version": 1,
-      "workflows": {
-        "ship": {
-          "name": "ship",
-          "created_at": "2026-08-29 08:12:44",
-          "steps": ["read the diff", "run the tests", "fix any failures"]
-        }
-      }
-    }
-
-Nothing interprets a step: it is handed to the agent verbatim, so a
-step can be an instruction, a question, or a file mention.
-
-``MANTRA_WORKFLOWS`` redirects the file for tests.
-"""
+"""Workflows: named ordered prompt sequences."""
 
 from __future__ import annotations
 
@@ -38,6 +14,8 @@ _OVERRIDE_ENV = "MANTRA_WORKFLOWS"
 
 _MAX_STEPS = 50
 _MAX_STEP_CHARS = 4000
+_LOCK_STALE = 5.0
+_LOCK_WAIT = 0.5
 
 
 def workflows_path() -> Path:
@@ -96,8 +74,32 @@ def load_all() -> dict[str, Any]:
     return data
 
 
+def _break_stale(lock_path: Path) -> None:
+    try:
+        age = time.time() - os.path.getmtime(lock_path)
+        if age >= _LOCK_STALE:
+            lock_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _save_all(data: dict[str, Any]) -> bool:
     target = workflows_path()
+    # File lock for inter-process safety.
+    lock_path = target.with_suffix(target.suffix + ".lock")
+    _break_stale(lock_path)
+    acquired = False
+    fd = None
+    start = time.monotonic()
+    while time.monotonic() - start < _LOCK_WAIT:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            acquired = True
+            break
+        except FileExistsError:
+            time.sleep(0.02)
+        except OSError:
+            break
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -115,7 +117,6 @@ def _save_all(data: dict[str, Any]) -> bool:
                 pass
             tmp.replace(target)
         except OSError:
-            # Fallback
             with open(target, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
             try:
@@ -124,6 +125,16 @@ def _save_all(data: dict[str, Any]) -> bool:
                 pass
     except OSError:
         return False
+    finally:
+        if acquired and fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
     return True
 
 

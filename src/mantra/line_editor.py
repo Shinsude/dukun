@@ -1,13 +1,4 @@
-"""Single-key line editor with an inline completion popup.
-
-The console needs to react *while* you type - show matching files after an
-``@`` and matching commands after a leading ``/``. ``input()`` cannot do
-that: it only yields the finished line. This reads one key at a time.
-
-Standard library only. Windows uses ``msvcrt.getwch()``; POSIX puts the
-terminal in raw mode. When stdin is not a terminal the editor steps aside
-and ``input()`` is used, so pipes, redirects and tests keep working.
-"""
+"""Single-key editor with completion popup; falls back to input when not tty."""
 
 from __future__ import annotations
 
@@ -493,13 +484,17 @@ class LineEditor:
             import time
 
             while not msvcrt.kbhit():
+                # Throttle size poll to avoid per-loop overhead.
                 try:
-                    cols, rows = term_size()
-                    if (self._term_cols is None or self._term_rows is None):
-                        self._term_cols, self._term_rows = cols, rows
-                    elif cols != self._term_cols or rows != self._term_rows:
-                        self._term_cols, self._term_rows = cols, rows
-                        return KEY_RESIZE
+                    now = time.monotonic()
+                    if now - getattr(self, "_last_size_poll", 0) >= 0.2:
+                        self._last_size_poll = now
+                        cols, rows = term_size()
+                        if (self._term_cols is None or self._term_rows is None):
+                            self._term_cols, self._term_rows = cols, rows
+                        elif cols != self._term_cols or rows != self._term_rows:
+                            self._term_cols, self._term_rows = cols, rows
+                            return KEY_RESIZE
                 except Exception:
                     pass
                 time.sleep(0.05)
@@ -518,6 +513,7 @@ class LineEditor:
             return char
 
         import select
+        import time as _time
         while True:
             try:
                 ready, _, _ = select.select([sys.stdin], [], [], 0.05)
@@ -525,12 +521,15 @@ class LineEditor:
                 ready = [sys.stdin]
 
             try:
-                cols, rows = term_size()
-                if (self._term_cols is None or self._term_rows is None):
-                    self._term_cols, self._term_rows = cols, rows
-                elif cols != self._term_cols or rows != self._term_rows:
-                    self._term_cols, self._term_rows = cols, rows
-                    return KEY_RESIZE
+                now = _time.monotonic()
+                if now - getattr(self, "_last_size_poll", 0) >= 0.2:
+                    self._last_size_poll = now
+                    cols, rows = term_size()
+                    if (self._term_cols is None or self._term_rows is None):
+                        self._term_cols, self._term_rows = cols, rows
+                    elif cols != self._term_cols or rows != self._term_rows:
+                        self._term_cols, self._term_rows = cols, rows
+                        return KEY_RESIZE
             except Exception:
                 pass
 

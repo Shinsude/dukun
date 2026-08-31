@@ -19,4 +19,3 @@ The evaluator contract examines the sandbox after the orchestrator finishes. It 
 ## Logger and Event Bus
 
 The logger contract receives structured events with a name and payload and never propagates input or output errors to the caller. Implementations append one record per line with a timestamp and use a lock for thread safety. The event bus contract allows subscription of handlers and fans out events synchronously while suppressing handler exceptions to isolate observers from the run and from each other.
-

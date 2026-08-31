@@ -1,25 +1,4 @@
-"""Skill bundles: discoverable procedures the agent can be told to follow.
-
-A skill is a directory holding a ``SKILL.md`` whose frontmatter names it
-and whose body is the procedure. A skill directory may also bundle its
-own ``scripts/`` or ``references/``, which is what makes a skill more
-than a prompt - the procedure can point at a real file beside it.
-
-Two mechanics are borrowed from the HARNESSY project's layout, because
-they are the parts that turn a pile of procedures into something
-navigable:
-
-- **route** - an ``INDEX.md`` catalog mapping each skill to one line
-  saying what it is for, so a request can be matched to a skill without
-  reading all forty of them.
-- **bundle** - a ``BUNDLES.md`` table naming ordered groups of skills
-  for a recurring job (``fix-bug`` = ``debug``, ``tdd``, ``check-work``).
-  The order is the point: reproduce, fix, verify.
-
-Roots are searched in order and MANTRA does not care where they came
-from: a skills directory is a skills directory. Set ``MANTRA_SKILLS``
-to a ``;``-separated list to point at any of them.
-"""
+"""Skills: discoverable procedures from skill directories."""
 
 from __future__ import annotations
 

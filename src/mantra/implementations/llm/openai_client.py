@@ -1,14 +1,4 @@
-"""OpenAI-compatible chat client using only the standard library.
-
-Works with any server exposing ``POST /v1/chat/completions`` with function
-calling: OpenAI, Azure OpenAI gateways, vLLM, Ollama, LM Studio, etc.
-The API key is read from the environment variable named in the config
-(``api_key_env``), never from configuration files.
-
-Streaming: when ``on_delta`` is provided, the request uses SSE and each
-content fragment is passed to the callback as it arrives (token-level
-display). Tool-call deltas are accumulated silently and returned complete.
-"""
+"""Chat completions client: stdlib only, buffered/streaming, retries."""
 
 from __future__ import annotations
 
@@ -29,24 +19,19 @@ from mantra.interfaces.llm_client import LLMClient, LLMResponse, ToolCall
 
 DeltaCallback = Callable[[str], None]
 
-# A connection dropped mid-stream surfaces as this rather than an OSError,
-# so it has to be named explicitly or it escapes the retry loop entirely.
+# Mid-stream drop surfaces as IncompleteRead, not OSError; handle explicitly.
 IncompleteRead = http.client.IncompleteRead
 
 
 def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMResponse:
-    """Reduce an OpenAI SSE chunk sequence into one LLMResponse.
-
-    Pure function over an iterable of decoded lines so it can be unit-tested
-    without a network. Handles content deltas, tool_call deltas keyed by
-    index, and the terminating ``data: [DONE]`` sentinel.
-    """
+    """Parse SSE stream into one response; accumulates tool calls by index."""
     content_parts: list[str] = []
     content_bytes = 0
-    # index -> {"id":..., "name":..., "args": "..."} accumulating fragments
+    # index -> fragments accumulating by tool index
     tool_acc: dict[int, dict[str, str]] = {}
     usage: dict | None = None
     malformed = 0
+    seen_done = False
 
     for raw in lines:
         line = raw.strip()
@@ -54,6 +39,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
             continue
         data = line[5:].strip()
         if data == "[DONE]":
+            seen_done = True
             break
         try:
             chunk = json.loads(data)
@@ -61,10 +47,9 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
             malformed += 1
             if malformed > 20:
                 raise LLMError("stream contained too many malformed chunks")
-            continue  # tolerate keep-alive comments / partial noise
+            continue  # tolerate keep-alive / noise
         malformed = 0
-        # The usage object rides in a final chunk that carries no choices,
-        # so it has to be read before the choices guard below.
+        # Usage may be in final chunk without choices; read early.
         if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
             usage = chunk["usage"]
         choices = chunk.get("choices") or []
@@ -94,7 +79,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
             slot = tool_acc.setdefault(idx, {"id": "", "name": "", "args": ""})
             if call.get("id"):
                 cid = str(call["id"])
-                # Keep first id, don't concatenate
+                # Keep first id only.
                 if not slot["id"]:
                     slot["id"] = cid
             fn = call.get("function") or {}
@@ -103,13 +88,16 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
                 slot["name"] = slot["name"] + name_part
             if fn.get("arguments") is not None:
                 arg_part = fn["arguments"]
-                # Some gateways send already-parsed dict
+                # Some gateways send parsed dict.
                 if isinstance(arg_part, dict):
                     arg_part = json.dumps(arg_part)
                 elif not isinstance(arg_part, str):
                     arg_part = str(arg_part)
                 slot["args"] += arg_part
 
+    # Stream ended without sentinel and no data is truncated.
+    if not seen_done and not content_parts and not tool_acc and usage is None:
+        raise LLMError("stream ended without DONE and no data")
     tool_calls = []
     for i, slot in sorted(tool_acc.items()):
         name = slot["name"].strip()
@@ -118,9 +106,7 @@ def parse_sse_stream(lines, on_delta: DeltaCallback | None = None) -> LLMRespons
         try:
             arguments = json.loads(slot["args"] or "{}")
         except json.JSONDecodeError as exc:
-            # A stream cut mid-argument leaves partial JSON. That is a
-            # transport failure like any other, so it has to come out as
-            # one instead of a ValueError that nothing upstream catches.
+            # Mid-stream cut leaves partial JSON; surface as LLMError.
             raise LLMError(
                 f"the response ended mid-tool-call ({name or 'call ' + str(i)}): {exc}"
             ) from exc
@@ -394,24 +380,58 @@ class OpenAICompatClient(LLMClient):
             payload = json.loads(body.decode("utf-8", errors="replace"))
         except Exception as exc:
             raise LLMError(f"could not translate payload for responses: {exc}") from exc
-        # Chat messages -> input string + tools translation minimal
+        # Chat messages -> input for Responses API. Include full history so tool results are seen.
         messages = payload.get("messages") or []
-        # last user message as input
-        prompt = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                prompt = m.get("content") or ""
-                break
-        if not prompt:
-            prompt = payload.get("input") or ""
+        parts: list[str] = []
+        for m in messages:
+            role = m.get("role", "")
+            content = m.get("content") or ""
+            if role == "system":
+                parts.append(f"System: {content}")
+            elif role == "user":
+                parts.append(f"User: {content}")
+            elif role == "assistant":
+                # include tool_calls summary
+                tc = m.get("tool_calls")
+                if tc:
+                    names = ", ".join((t.get("function") or {}).get("name", "?") for t in tc)
+                    parts.append(f"Assistant called {names}: {content}")
+                else:
+                    parts.append(f"Assistant: {content}")
+            elif role == "tool":
+                parts.append(f"Tool {m.get('name','')} result: {content[:2000]}")
+        prompt = "\n\n".join(parts) if parts else (payload.get("input") or "")
         # Build responses payload
         resp_payload: dict[str, Any] = {
             "model": payload.get("model", self.model),
             "input": prompt,
         }
-        # Tools: Go Responses API validates tools strictly — don't send MANTRA's file tools via responses fallback
-        # Let the model answer without tools first; tool calls will be available via next turn's chat path if needed.
-        # (previous attempt passed chat tools verbatim and got 400 invalid_request_error tools[0])
+        # Translate chat tools -> responses tools (agnostic, not zen-specific)
+        chat_tools = payload.get("tools") or []
+        if chat_tools:
+            resp_tools = []
+            for t in chat_tools:
+                if not isinstance(t, dict):
+                    continue
+                # Chat: {"type":"function","function":{"name","description","parameters"}}
+                # Responses: {"type":"function","name","description","parameters","strict":false}
+                if t.get("type") == "function" and isinstance(t.get("function"), dict):
+                    fn = t["function"]
+                    resp_tools.append(
+                        {
+                            "type": "function",
+                            "name": fn.get("name"),
+                            "description": fn.get("description") or "",
+                            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+                            "strict": False,
+                        }
+                    )
+                elif t.get("name"):
+                    # Already responses-like
+                    resp_tools.append(t)
+            if resp_tools:
+                resp_payload["tools"] = resp_tools
+                resp_payload["tool_choice"] = "auto"
         request = urllib.request.Request(
             f"{self.base_url}/responses",
             data=json.dumps(resp_payload).encode("utf-8"),

@@ -39,4 +39,3 @@ Host-level orchestration and permission plumbing, multi-agent fan-out, integrity
 ## Current State After Remediation
 
 Following the recent remediation, the adopted features now include hardened path confinement at every file and command boundary, owner-only permissions for staged container files, bounded streaming and memory handling, and validated configuration limits. The suite of adopted ideas remains small, test-locked, and free of host-specific dependencies, preserving the original goal of a personal daily driver that is easy to move and easy to reason about.
-

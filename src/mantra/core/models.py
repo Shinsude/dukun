@@ -1,14 +1,4 @@
-"""Discovering the models an endpoint actually serves.
-
-The point of asking for only a base URL and a key is that MANTRA can then
-read the catalogue itself, rather than making the user type a model name
-they have to look up somewhere else. That is a plain GET on ``/models``,
-which everything speaking the OpenAI protocol implements.
-
-The list is a convenience, never a gate: if discovery fails the user can
-still type a model name by hand, which matters for endpoints that hide
-their catalogue or front it with a proxy.
-"""
+"""Model discovery: fetch catalogue from endpoint."""
 
 from __future__ import annotations
 
@@ -51,12 +41,8 @@ _NOISE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Date-stamped snapshots: ``gpt-4o-2024-11-20``, ``gpt-4o-20241120``,
-# ``claude-3-5-sonnet-20241022``. Real and selectable, but they are the
-# frozen form of a model that is also listed under its plain name, so
-# they are ranked to the bottom instead of crowding out the name the
-# operator was looking for.
-_SNAPSHOT_RE = re.compile(r"-(20\d{2})-?(\d{2})?-?(\d{2})?$")
+# Dated snapshots: -YYYY-MM-DD or -YYYYMMDD. Rank last.
+_SNAPSHOT_RE = re.compile(r"-(20\d{2}-\d{2}-\d{2})$|-(20\d{6})$")
 
 
 def is_reasoning_model(model_id: str) -> bool:

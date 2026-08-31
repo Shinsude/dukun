@@ -1,4 +1,4 @@
-"""Command execution and git tools."""
+"""Command and git tools."""
 
 from __future__ import annotations
 

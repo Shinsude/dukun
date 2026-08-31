@@ -1,4 +1,4 @@
-"""File operation tools."""
+"""File tools: read, write, edit, list with caps and ledger."""
 
 from __future__ import annotations
 
@@ -27,14 +27,14 @@ class ReadFileTool(Tool):
         "properties": {"path": {"type": "string", "description": "Relative file path"}},
         "required": ["path"],
     }
-    ledger = None  # EditLedger, injected by the registry
+    ledger = None  # injected by registry
 
     def execute(self, sandbox: Sandbox, path: str) -> str:
         if "\x00" in path or "\n" in path or "\r" in path:
             return "ERROR: invalid path"
         try:
             content = sandbox.read_file(path)
-        except Exception as exc:  # noqa: BLE001 - return as observation
+        except Exception as exc:  # noqa: BLE001
             return f"ERROR: cannot read {path}: {exc}"
         if self.ledger is not None:
             self.ledger.remember(path, content)
@@ -118,7 +118,7 @@ class EditFileTool(Tool):
                     "read it again, then retry the edit"
                 )
         else:
-            # Ledger missing is a wiring bug — fail closed rather than blind edit
+            # No ledger is wiring bug; fail closed.
             return "ERROR: edit ledger not configured"
         if old_string not in content:
             return f"ERROR: old_string not found in {path}"
@@ -144,13 +144,12 @@ class ListDirTool(Tool):
     }
 
     def execute(self, sandbox: Sandbox, path: str) -> str:
-        # Basic validation to reduce injection risk for shell fallbacks
+        # Validate to reduce injection risk.
         if "\x00" in path or "\n" in path or "\r" in path:
             return "ERROR: invalid path"
         root = getattr(sandbox, "root", None)
         if root is None:
-            # Sandboxes without a direct file view list via shell.
-            # Validate against shell metacharacters and use safe quoting.
+            # No direct view: use shell with safe quoting.
             if _SHELL_META_RE.search(path) or '"' in path or "'" in path:
                 return "ERROR: path contains unsupported characters for shell listing"
             quoted = shlex.quote(path)
@@ -168,7 +167,7 @@ class ListDirTool(Tool):
                 last_error = result.stderr or "listing failed"
             return f"ERROR: {last_error}"
 
-        # Direct file view: resolve and ensure confinement
+        # Direct view: resolve and check confinement.
         base = root if path in (".", "") else os.path.join(root, path)
         try:
             real_base = os.path.realpath(base)

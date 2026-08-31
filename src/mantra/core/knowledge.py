@@ -1,9 +1,4 @@
-"""System-prompt assembly: base prompt + registry + memory + repo instructions.
-
-Adopted from the workflow-layer harness: durable knowledge is injected into
-every session so fixed failure classes stay fixed and project state survives
-restarts - with a hard cap so it can never grow into bloat.
-"""
+"""Assemble system prompt from base, env, failures, memory, instructions."""
 
 from __future__ import annotations
 
@@ -16,11 +11,8 @@ from typing import Any
 
 _memory_lock = threading.Lock()
 
-# How long to wait for another process to finish writing memory, and how
-# old a lock has to be before it is assumed abandoned. The wait is short
-# because it lands on the interactive thread once per turn; the stale
-# window has to be comfortably longer than a write takes.
-_LOCK_WAIT_SECONDS = 0.5
+# Lock wait and stale thresholds for memory writes.
+_LOCK_WAIT_SECONDS = 1.0
 _LOCK_STALE_SECONDS = 10.0
 
 MEMORY_CAP_CHARS = 8000
@@ -38,8 +30,7 @@ def find_instructions_file(workspace: str) -> str | None:
 
 
 def render_environment(workspace: str) -> str:
-    """Collect host and workspace facts so the model uses correct commands for the current platform.
-    """
+    """Collect host and workspace facts for correct command choice."""
     lines = [
         f"- date: {time.strftime('%Y-%m-%d')}",
         f"- os: {platform.system()} {platform.release()}",
@@ -50,13 +41,13 @@ def render_environment(workspace: str) -> str:
     repo_state, flag = _git_checked(workspace, "rev-parse", "--is-inside-work-tree")
     if repo_state == "ok" and flag == "true":
         branch_state, branch = _git_checked(workspace, "rev-parse", "--abbrev-ref", "HEAD")
-        # A freshly initialised repo has no HEAD until the first commit.
+        # New repo has no HEAD until first commit.
         branch = (branch or "(no commits yet)") if branch_state == "ok" else "unknown"
         dirty_state, dirty = _git_checked(workspace, "status", "--porcelain")
         if dirty_state == "ok":
             state = "clean" if not dirty else f"{len(dirty.strip().splitlines())} modified"
         else:
-            # "clean" here would be a guess dressed up as a fact.
+            # Avoid guessing clean when probe failed.
             state = "state unknown (status probe failed)"
         lines.append(f"- git: branch {branch} ({state})")
     elif repo_state == "error":
@@ -73,33 +64,13 @@ def _shell_name() -> str:
 
 
 def _git(workspace: str, *args: str) -> str:
-    """Output of one git call, or an empty string if it did not succeed.
-
-    Convenience wrapper for callers that genuinely do not care why a
-    probe failed. Anything that has to tell "clean" from "unknown" must
-    use :func:`_git_checked` instead.
-    """
+    """Run git; return output or empty on failure. Use _git_checked if reason matters."""
     ok, output = _git_checked(workspace, *args)
     return output if ok else ""
 
 
 def _git_checked(workspace: str, *args: str) -> tuple[str, str]:
-    """How the call went, and what it printed.
-
-    The state is one of three values, because two different failures
-    look identical if only the output is examined:
-
-    ``"ok"``     the command ran and exited zero
-    ``"no"``     the command ran and refused - for a boolean probe such as
-                 "is this a repository" that is a definitive answer, not
-                 a failure
-    ``"error"``  the command could not be run at all, or timed out, and
-                 nothing is known
-
-    Collapsing ``no`` into ``error`` reported an ordinary non-repository
-    directory as an unknown state, and collapsing ``error`` into ``ok``
-    reported a timed-out status probe as a clean working tree.
-    """
+    """Run git; return (ok/no/error, output)."""
     try:
         completed = subprocess.run(
             ["git", *args],
@@ -122,7 +93,7 @@ def assemble_system_prompt(
     instructions_path: str | None = None,
     environment: str | None = None,
 ) -> str:
-    """Append registry, memory, and repo-instruction sections when they exist."""
+    """Append optional sections when present."""
     sections = [base_prompt]
 
     if environment:
@@ -149,7 +120,7 @@ def assemble_system_prompt(
         )
 
     result = "\n\n".join(sections)
-    # Total cap to prevent context blow-up (base + caps could exceed 20k)
+    # Cap total size to prevent blow-up.
     TOTAL_CAP = 20000
     if len(result) > TOTAL_CAP:
         result = result[:TOTAL_CAP] + "\n... [truncated]"
@@ -167,31 +138,41 @@ def _read_capped(path: str | None, cap: int) -> str:
 
 
 def _read_tail(path: str | None, cap: int) -> str:
-    """Newest entries are appended last, so keep the tail of the file."""
+    """Keep tail; newest entries are last."""
     if not path or not os.path.isfile(path):
         return ""
     try:
+        size = os.path.getsize(path)
+        if size > cap * 2:
+            # Avoid loading huge file; seek near tail.
+            with open(path, "rb") as handle:
+                handle.seek(max(0, size - cap - 500))
+                data = handle.read(cap + 1000)
+                content = data.decode("utf-8", errors="replace")
+                # If we started mid-file, drop partial line.
+                if size > cap + 500:
+                    content = content.split("\n", 1)[-1] if "\n" in content else content
+                if len(content) > cap:
+                    content = content[-cap:]
+                    content = content.split("\n", 1)[-1]
+                return content
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             content = handle.read()
     except OSError:
         return ""
     if len(content) > cap:
-        # Cut at a line boundary so no half-entry is shown.
+        # Cut at line boundary to avoid half-entry.
         content = content[-cap:]
         content = content.split("\n", 1)[-1]
     return content
 
 
 def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHARS) -> bool:
-    """Append one dated entry, pruning oldest lines beyond the cap.
-
-    Returns True when the write succeeded; missing parent dirs are created.
-    Uses a per process lock and an atomic file replacement to reduce races.
-    """
+    """Append entry, prune oldest lines, atomic write."""
     if not memory_path or not text.strip():
         return False
     entry = text.rstrip() + "\n"
-    # Per process lock to serialize concurrent appends within this process
+    # Serialize concurrent appends in this process.
     with _memory_lock:
         existing = _read_file(memory_path)
         combined = (existing + "\n" + entry).lstrip("\n") if existing else entry
@@ -211,18 +192,14 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                     pass
             except OSError:
                 pass
-        # File lock for inter process coordination via lock file (best effort)
+        # Inter-process lock via file (best effort).
         lock_path = memory_path + ".lock"
         lock_acquired = False
         lock_handle = None
         try:
-            # A process that died holding the lock leaves the file behind
-            # forever, after which every append waits out the full
-            # deadline and then writes unprotected anyway. Anything older
-            # than the stale window belonged to a process that is gone.
+            # Remove stale lock from crashed process.
             _break_stale_lock(lock_path)
-            # Try to acquire file lock with timeout. The wait is short:
-            # this runs on the interactive thread, once per turn.
+            # Brief lock wait on interactive thread.
             start = time.monotonic()
             while time.monotonic() - start < _LOCK_WAIT_SECONDS:
                 try:
@@ -234,17 +211,16 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                     time.sleep(0.02)
                 except OSError:
                     break
-            # Re-read after acquiring lock to avoid lost update
-            if lock_acquired:
-                fresh = _read_file(memory_path)
-                if fresh != existing:
-                    combined = (fresh + "\n" + entry).lstrip("\n") if fresh else entry
-                    while len(combined) > cap:
-                        lines = combined.split("\n")
-                        combined = "\n".join(lines[1:])
-                        if "\n" not in combined and len(combined) > cap:
-                            combined = combined[-cap:]
-                            break
+            # Re-read before write to avoid lost update (even without lock).
+            fresh = _read_file(memory_path)
+            if fresh != existing:
+                combined = (fresh + "\n" + entry).lstrip("\n") if fresh else entry
+                while len(combined) > cap:
+                    lines = combined.split("\n")
+                    combined = "\n".join(lines[1:])
+                    if "\n" not in combined and len(combined) > cap:
+                        combined = combined[-cap:]
+                        break
             tmp_path = memory_path + ".tmp"
             try:
                 with open(tmp_path, "w", encoding="utf-8", newline="\n") as handle:
@@ -256,7 +232,7 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                 os.replace(tmp_path, memory_path)
                 return True
             except OSError:
-                # Fallback to direct write
+                # Fallback: direct write.
                 try:
                     with open(memory_path, "w", encoding="utf-8", newline="\n") as handle:
                         handle.write(combined)

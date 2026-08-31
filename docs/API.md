@@ -31,4 +31,3 @@ Logger receives structured events and never propagates input or output errors. I
 ## Registry
 
 The registry maps short names to concrete classes for language-model clients, sandboxes, tools, evaluators, and loggers. Construction forwards only those configuration keys that match constructor parameters and validates that required parameters are present, reporting unknown names or missing parameters as configuration errors. Tool construction shares a single ledger and deduplicates tools that resolve to the same implementation.
-

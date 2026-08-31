@@ -1,8 +1,4 @@
-"""Test-command evaluator.
-
-Passes when the configured command exits zero inside the task sandbox.
-This mirrors how SWE-bench-style hidden tests score a run.
-"""
+"""Evaluator: passes when test command exits zero."""
 
 from __future__ import annotations
 

@@ -25,4 +25,3 @@ Persistent state to preserve includes the workspace directory, the user-wide set
 ### Recovery
 
 Recovery from corrupted user settings or credentials is automatic, treating the file as empty and continuing with defaults, with a quarantined copy of the corrupted file retained alongside the original. Recovery from a corrupted session transcript skips the unreadable file and continues to list the remaining transcripts. Recovery from a corrupted workflow file similarly returns an empty collection. Recovery from a sandbox failure is performed by the orchestrator, which ensures that the evaluator still produces a verdict and that cleanup is attempted even after errors, and that abort signals are propagated to running commands.
-

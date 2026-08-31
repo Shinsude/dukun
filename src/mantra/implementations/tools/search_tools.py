@@ -1,8 +1,4 @@
-"""Code search tools.
-
-The content search walks the workspace in pure Python so it works in any
-sandbox with a file view and needs no external grep binary.
-"""
+"""Search tools: pure-Python workspace walk."""
 
 from __future__ import annotations
 
@@ -52,6 +48,7 @@ class SearchCodeTool(Tool):
 
         hits: list[str] = []
         real_root = os.path.realpath(root)
+        scanned = 0
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             # Prevent descending into symlinked dirs that escape workspace
             dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
@@ -73,12 +70,10 @@ class SearchCodeTool(Tool):
                     continue
                 full = os.path.join(dirpath, filename)
                 try:
-                    # Skip symlinked files that escape workspace
                     if os.path.islink(full):
                         real = os.path.realpath(full)
                         if not (real == real_root or real.startswith(real_root + os.sep)):
                             continue
-                    # Skip hard-linked files that could expose outside content
                     try:
                         if os.stat(full).st_nlink > 1:
                             continue
@@ -88,11 +83,14 @@ class SearchCodeTool(Tool):
                         continue
                 except OSError:
                     continue
+                scanned += 1
+                if scanned > 3000:
+                    break
                 rel = os.path.relpath(full, root)
                 hits.extend(self._scan_file(full, rel, query, real_root))
                 if len(hits) >= _MAX_RESULTS:
                     break
-            if len(hits) >= _MAX_RESULTS:
+            if len(hits) >= _MAX_RESULTS or scanned > 3000:
                 break
         if not hits:
             return "(no matches)"
@@ -150,6 +148,7 @@ class FindFileTool(Tool):
 
         matches = []
         real_root = os.path.realpath(root)
+        scanned = 0
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
             filtered = []
@@ -178,8 +177,13 @@ class FindFileTool(Tool):
                         pass
                 except OSError:
                     continue
+                scanned += 1
+                if scanned > 3000:
+                    break
                 if pattern in filename:
                     matches.append(os.path.relpath(full, root))
                     if len(matches) >= _MAX_RESULTS:
                         return "\n".join(matches)
+            if scanned > 3000:
+                break
         return "\n".join(matches) or "(no matches)"

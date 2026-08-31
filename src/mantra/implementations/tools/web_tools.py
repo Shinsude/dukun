@@ -1,11 +1,4 @@
-"""Network tools: fetching a URL and reading it as text.
-
-The harness has no third-party dependencies, so this uses ``urllib``
-and ``html.parser`` rather than requests and BeautifulSoup. That costs
-some fidelity - the extractor is a tag stripper, not a layout engine -
-but a coding agent only needs the readable text of a page, and the
-stdlib version cannot drift out of date or fail to install.
-"""
+"""Web fetch: retrieve URL, extract readable text."""
 
 from __future__ import annotations
 
@@ -24,11 +17,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen a
 from mantra.interfaces.sandbox import Sandbox
 from mantra.interfaces.tool import Tool
 
-# A response bigger than this is almost certainly not something worth
-# putting in a context window. The compressed bytes are capped on the way
-# in and the inflated bytes are capped *during* decompression, so a
-# highly compressible payload cannot expand without bound on its way to
-# being truncated.
+# Cap compressed and inflated size to bound memory.
 _MAX_BYTES = 2_000_000
 _MAX_INFLATED = 4_000_000
 
@@ -41,8 +30,7 @@ _BLOCKED_HOSTS = frozenset(
     }
 )
 
-# Long enough for a slow documentation host, short enough that a hung
-# socket does not stall a turn for a minute.
+# Timeout balances slow hosts vs hung sockets.
 _TIMEOUT = 15
 
 _DEFAULT_MAX_CHARS = 12000
@@ -50,6 +38,10 @@ _DEFAULT_MAX_CHARS = 12000
 _USER_AGENT = "MANTRA/1.0 (coding harness; +https://github.com/mantra)"
 
 _TEXTUAL = ("text/", "application/json", "application/xml", "application/javascript")
+
+# Cache DNS results to avoid repeated 2s stalls.
+_DNS_CACHE: dict[str, tuple[float, bool]] = {}
+_DNS_TTL = 300.0
 
 
 class _TextExtractor(HTMLParser):
@@ -310,12 +302,15 @@ def _is_private_hostname(hostname: str | None) -> bool:
                 return True
         except (IndexError, ValueError):
             pass
-    # Additional DNS resolution check for hostnames that may resolve to private
-    # This mitigates DNS rebinding where a name resolves to an internal address.
-    # Best effort with short timeout, failures are treated as not private.
-    # Uses thread pool to avoid mutating global socket timeout.
+    # DNS check with cache to avoid repeated stalls.
     try:
         if re.match(r"^[a-z0-9.-]+$", host):
+            import time as _time
+            now = _time.monotonic()
+            cached = _DNS_CACHE.get(host)
+            if cached and now - cached[0] < _DNS_TTL:
+                return cached[1]
+            result = False
             def _resolve():
                 return socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
 
@@ -324,15 +319,20 @@ def _is_private_hostname(hostname: str | None) -> bool:
                 try:
                     infos = fut.result(timeout=2)
                 except concurrent.futures.TimeoutError:
+                    _DNS_CACHE[host] = (now, False)
                     return False
                 for family, _, _, _, sockaddr in infos:
                     addr = sockaddr[0]
                     try:
                         ip = ipaddress.ip_address(addr.split("%")[0])
                         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-                            return True
+                            result = True
+                            break
                     except ValueError:
                         continue
+            _DNS_CACHE[host] = (now, result)
+            if result:
+                return True
     except Exception:
         pass
     return False
@@ -346,20 +346,27 @@ def _check_url_allowed(url: str) -> str | None:
     scheme = (parsed.scheme or "").lower()
     if scheme not in ("http", "https"):
         return f"fetch failed: unsupported scheme '{parsed.scheme or 'none'}' - only http and https can be fetched"
-    # Decode percent-encoded hostname for SSRF checks (e.g. %31%32%37)
+    # Fully decode host (handles double encoding).
+    def _fully_decode(s: str) -> str:
+        prev = s
+        for _ in range(5):
+            cur = urllib.parse.unquote(prev)
+            if cur == prev:
+                break
+            prev = cur
+        return prev
     hostname = parsed.hostname
     if hostname:
         try:
-            hostname = urllib.parse.unquote(hostname)
+            hostname = _fully_decode(hostname)
         except Exception:
             pass
     if _is_private_hostname(hostname):
         return f"fetch failed: blocked private or internal host {parsed.hostname!r}"
-    # Also check netloc for encoded IP without hostname parsing
     if not hostname and parsed.netloc:
-        # urlparse may fail to extract hostname for malformed URLs like http://0x7f.1
         try:
-            netloc = urllib.parse.unquote(parsed.netloc.split("@")[-1].split(":")[0])
+            raw = parsed.netloc.split("@")[-1].split(":")[0]
+            netloc = _fully_decode(raw)
             if _is_private_hostname(netloc):
                 return f"fetch failed: blocked private or internal host {netloc!r}"
         except Exception:

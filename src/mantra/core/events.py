@@ -1,4 +1,4 @@
-"""Minimal synchronous event bus for hooks and observability."""
+"""Sync event bus for hooks and observability."""
 
 from __future__ import annotations
 
@@ -8,11 +8,7 @@ EventHandler = Callable[[str, dict[str, Any]], None]
 
 
 class EventBus:
-    """Fan-out of harness events to subscribed callbacks.
-
-    Subscriber exceptions are swallowed by design: an observer must never
-    break the agent run it is watching.
-    """
+    """Fan-out events; swallow handler errors to isolate observers."""
 
     def __init__(self) -> None:
         self._handlers: list[EventHandler] = []

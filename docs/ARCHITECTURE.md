@@ -29,4 +29,3 @@ Streaming is optional and callback-driven. When a delta handler is supplied, con
 Approval is modeled as a separate policy with four modes that are evaluated per tool call. Read-only operations are always allowed. The prompt for confirmation is supplied by the front end, keeping the policy testable and free of terminal input handling. Affirmative answers are remembered for the remainder of the session on a per-tool-key basis.
 
 Persistence is file-based and atomic. Settings, credentials, workflows, and session transcripts are written via temporary files with restricted permissions and then moved into place, with quarantine handling for corrupted files.
-

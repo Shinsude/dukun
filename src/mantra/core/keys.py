@@ -1,18 +1,4 @@
-"""Resolution and storage of API keys (bring your own key).
-
-Two sources, consulted in this order:
-
-1. the environment variable named by ``api_key_env``
-2. ``~/.mantra/credentials.json``, written by ``/connect``
-
-The environment is preferred and is what the docs recommend. The file
-exists because pasting a long key into a user-scope variable and then
-opening a new terminal is the single most common setup failure, and a
-silent 401 three steps into a task is a miserable way to discover it.
-
-The file is created with owner-only permissions and MANTRA never prints
-a stored key in full - only a masked form such as ``sk-p…9f2a``.
-"""
+"""Key resolution: env first, then store; masked display."""
 
 from __future__ import annotations
 

@@ -1,8 +1,4 @@
-"""Evaluator that always passes.
-
-For interactive console sessions where there is no hidden test command:
-the run's success is judged by the operator, not by an automated grader.
-"""
+"""Evaluator: always passes for interactive sessions."""
 
 from __future__ import annotations
 

@@ -1,16 +1,4 @@
-"""Tool-call approval policy.
-
-A daily-driver agent needs a gate between "the model asked" and "the host
-did it". This module classifies what a tool is about to do; the front end
-supplies the actual prompt through an ``ask`` callback, so the policy stays
-testable and the TUI owns all terminal I/O.
-
-Modes:
-    default  auto-allow read-only work, ask about anything that mutates
-    auto     auto-allow mutations too, still ask about destructive commands
-    yolo     allow everything (trusted throwaway work only)
-    plan     refuse every mutation without asking (read-only exploration)
-"""
+"""Tool approval: classify risk, gate mutations, delegate prompting."""
 
 from __future__ import annotations
 
@@ -24,7 +12,7 @@ MUTATING_TOOLS = frozenset({"write_file", "edit_file", "run_command", "git_reset
 
 MODES = ("default", "auto", "yolo", "plan")
 
-# Patterns that can destroy work outside the model's ability to restore it.
+# Patterns that can irreversibly destroy work.
 _DESTRUCTIVE = (
     r"rm\s+(-[rRfF]+\s+)*[^\s]*\s*(-[rRfF]+)",  # rm -rf / rm -fr
     r"\brm\s+-[rR]",
@@ -63,7 +51,7 @@ _DESTRUCTIVE = (
     r"\battrib\s+",
 )
 
-# Read-only inspection: safe to run unattended in every mode.
+# Safe read-only commands: auto-allowed in all modes.
 _SAFE_COMMANDS = (
     r"^\s*(ls|dir|cat|type|echo|head|tail|wc|find|rg|grep|where|which|pwd|cd)\b",
     r"^\s*git\s+(status|diff|log|show|branch|rev-parse|ls-files|remote)\b",
@@ -110,7 +98,7 @@ def classify(tool: str, arguments: dict[str, Any]) -> tuple[str, str]:
 
 
 class ApprovalPolicy:
-    """Decides whether a tool call may execute."""
+    """Gate tool execution by risk and mode."""
 
     def __init__(
         self,
@@ -165,14 +153,24 @@ class ApprovalPolicy:
     def _key(tool: str, arguments: dict[str, Any]) -> str:
         if tool == "run_command":
             command = str(arguments.get("command", "")).strip()
-            # Lowercase for command matching (helps Windows), but keep path case
-            # for file tools below — Linux paths are case-sensitive.
-            return f"run_command::{' '.join(command.split()).lower()}"
+            # Lowercase verb for matching; preserve path case.
+            parts = command.split()
+            if parts:
+                parts[0] = parts[0].lower()
+                # Lowercase flags, keep path-like tokens as-is.
+                normalized = [parts[0]]
+                for tok in parts[1:]:
+                    if tok.startswith("-") or tok in ("|", "&&", ";", ">", ">>", "<"):
+                        normalized.append(tok.lower())
+                    elif "/" in tok or "\\" in tok or tok.endswith((".py", ".js", ".ts", ".json", ".md", ".txt")):
+                        normalized.append(tok)
+                    else:
+                        normalized.append(tok.lower() if tok.isalpha() else tok)
+                return f"run_command::{' '.join(normalized)}"
+            return "run_command::"
         if tool in ("write_file", "edit_file"):
-            # Preserve case for Linux; normalize separators via ledger logic
+            # Preserve case; normalize separators for consistent keys.
             p = str(arguments.get("path", "")).replace("\\", "/")
-            # Don't lowercase — `Secret.txt` vs `secret.txt` are different on Linux
-            # Use posix norm for consistent key
             import posixpath
 
             p = posixpath.normpath(p)

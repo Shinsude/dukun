@@ -1,25 +1,4 @@
-"""Saved conversations, so a session can be picked up where it left off.
-
-One JSON file per session under ``~/.mantra/sessions/``. The store is
-deliberately dumb - it writes what the console hands it and never
-interprets the contents - because the interesting decisions (what counts
-as a session, what to name it, when to save) belong to the caller.
-
-Each file is::
-
-    {
-      "version": 1,
-      "name": "k-chat-20260829-0812",
-      "saved_at": "2026-08-29 08:12:44",
-      "workspace": "C:\\Users\\arif-\\K-CHAT",
-      "model": "mistral-medium-latest",
-      "summary": "the first user message, for the picker",
-      "totals": {"tokens_in": 0, ...},
-      "messages": [...]
-    }
-
-``MANTRA_SESSIONS`` redirects the directory for tests.
-"""
+"""Sessions: one JSON per saved conversation."""
 
 from __future__ import annotations
 

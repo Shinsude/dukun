@@ -1,32 +1,4 @@
-"""The user's own MANTRA settings: endpoints, models and the active pick.
-
-Everything here lives in one hand-editable file, ``~/.mantra/config.json``:
-
-    {
-      "version": 1,
-      "endpoints": {
-        "openai": {
-          "base_url": "https://api.openai.com/v1",
-          "api_key_env": "OPENAI_API_KEY",
-          "models": ["gpt-4o", "gpt-4o-mini"]
-        }
-      },
-      "active": {
-        "endpoint": "openai",
-        "model": "gpt-4o",
-        "reasoning_effort": null
-      }
-    }
-
-``/connect`` writes it, but nothing requires ``/connect``: edit the file
-by hand, add an endpoint or type a model into ``models``, and MANTRA
-picks it up on the next command. There are no built-in providers any
-more, so this file is the whole list.
-
-Keys are never stored here - only the *name* of the environment
-variable or credential-store entry the key lives in. Keys themselves
-stay in ``core/keys.py``.
-"""
+"""User settings: endpoints, active pick, skill prefs."""
 
 from __future__ import annotations
 
@@ -76,6 +48,7 @@ _last_error: str | None = None
 
 # A lock this old belonged to a process that is gone.
 _LOCK_STALE_SECONDS = 5.0
+_LOCK_WAIT = 0.5
 
 
 def last_error() -> str | None:
@@ -127,6 +100,15 @@ def _quarantine(file: Path, reason: str) -> str | None:
         return None
 
 
+def _break_stale_lock(lock_path: Path) -> None:
+    try:
+        age = time.time() - os.path.getmtime(lock_path)
+        if age >= _LOCK_STALE_SECONDS:
+            lock_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _write(data: dict[str, Any]) -> None:
     file = path()
     file.parent.mkdir(parents=True, exist_ok=True)
@@ -134,14 +116,25 @@ def _write(data: dict[str, Any]) -> None:
         os.chmod(file.parent, 0o700)
     except OSError:
         pass
-    # The document was handed to the user to edit by hand, so it will be
-    # broken sometimes. Writing empty defaults over a file we could not
-    # parse turned one stray comma into the loss of every endpoint.
     if _last_error is not None:
         _quarantine(file, _last_error)
     data["version"] = _VERSION
     content = json.dumps(data, indent=2, sort_keys=True) + "\n"
-    # Atomic write via temporary file to avoid corruption on interruption
+    # File lock for inter-process safety (best effort).
+    lock_path = file.with_suffix(file.suffix + ".lock")
+    _break_stale_lock(lock_path)
+    acquired = False
+    lock_fd = None
+    start = time.monotonic()
+    while time.monotonic() - start < _LOCK_WAIT:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            acquired = True
+            break
+        except FileExistsError:
+            time.sleep(0.02)
+        except OSError:
+            break
     tmp = file.with_suffix(file.suffix + ".tmp")
     try:
         tmp.write_text(content, encoding="utf-8")
@@ -151,7 +144,6 @@ def _write(data: dict[str, Any]) -> None:
             pass
         tmp.replace(file)
     except OSError:
-        # Fallback to direct write if atomic fails
         try:
             file.write_text(content, encoding="utf-8")
             try:
@@ -160,6 +152,16 @@ def _write(data: dict[str, Any]) -> None:
                 pass
         except OSError:
             pass
+    finally:
+        if acquired and lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def load() -> dict[str, Any]:

@@ -35,4 +35,3 @@ Host sandbox runs in the workspace folder. Validates inputs, blocks traversal an
 # Tests
 
 The offline suite exercises the orchestration loop, context truncation, configuration validation, the read-before-edit contract, memory capping and truncation handling, instruction discovery, the streaming parser with malformed-chunk limits, model discovery filtering, approval classification, session persistence, and file-tool safety checks. Running the suite requires no network access or credentials. Live probes are available for end-to-end verification with valid credentials and network access when desired.
-

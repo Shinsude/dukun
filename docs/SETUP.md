@@ -28,5 +28,4 @@ The interactive console requires a terminal for full functionality. When standar
 
 ## Verification
 
-The test suite is discovered in the dedicated test directory with the module search path adjusted to include the source directory. Running the suite exercises offline paths without network access or credentials, covering the orchestration loop, context truncation, configuration validation, the read-before-edit contract, memory capping, instruction discovery, the streaming parser with malformed-chunk handling, model discovery filtering, approval classification, session persistence, and file-tool safety checks. Live probes are available for end-to-end verification with valid credentials and are not required for the offline suite.
-
+The test suite is discovered in a dedicated test directory with the module search path adjusted to include the source directory. Running the suite exercises offline paths without network access or credentials, covering the orchestration loop, context truncation, configuration validation, the read-before-edit contract, memory capping, instruction discovery, the streaming parser with malformed-chunk handling, model discovery filtering, approval classification, session persistence, and file-tool safety checks. Live probes are available for end-to-end verification with valid credentials and are not required for the offline suite.

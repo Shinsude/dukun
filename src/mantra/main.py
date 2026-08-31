@@ -1,12 +1,4 @@
-"""MANTRA CLI entrypoint — headless runner.
-
-Usage:
-    python -m mantra.main --config CONFIG --task TASK
-    mantra-headless --config CONFIG --task TASK
-
-The task file is JSON matching the guide's task format (problem_statement,
-optional repo_url/base_commit/setup_cmd/test_cmd).
-"""
+"""Headless runner: loads config and task, runs loop, grades result."""
 
 from __future__ import annotations
 
@@ -26,11 +18,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 
 
 def _resolve_path(path: str) -> str:
-    """Accept paths relative to the caller's cwd OR to the MANTRA folder.
-
-    Lets ``python MANTRA\\main.py --config examples\\config.json`` work from
-    any directory without requiring cd into the project first.
-    """
+    """Resolve path against cwd or project root."""
     if os.path.exists(path):
         return path
     candidate = os.path.join(PROJECT_ROOT, path)
@@ -58,11 +46,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: cannot read task file: {exc}", file=sys.stderr)
         return 2
 
-    # Relative log paths anchor to the MANTRA folder, not the caller's cwd.
+    # Anchor relative log path to project root.
     log_path = config["logging"].get("path")
     if log_path and not os.path.isabs(log_path):
         config["logging"]["path"] = os.path.join(PROJECT_ROOT, log_path)
-    if not task.get("problem_statement"):
+    stmt = task.get("problem_statement")
+    if not isinstance(stmt, str) or not stmt.strip():
         print("error: task file must contain 'problem_statement'", file=sys.stderr)
         return 2
 

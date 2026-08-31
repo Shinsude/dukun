@@ -1,9 +1,4 @@
-"""Configuration loading for MANTRA.
-
-Accepts JSON natively and YAML when PyYAML is installed. Secrets are never
-stored in config files: the LLM section names an environment variable that
-holds the API key at runtime.
-"""
+"""Config loading: JSON native, YAML optional. No secrets on disk."""
 
 from __future__ import annotations
 
@@ -13,18 +8,18 @@ import os
 
 from mantra.core.exceptions import ConfigError
 
-# Reasoning effort levels, ordered from fastest to most thorough. None omits the field.
+# Reasoning efforts; null omits the field.
 REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 DEFAULTS = {
-    "system_prompt": None,  # falls back to the loop default
+    "system_prompt": None,  # loop default if unset
     "max_steps": 30,
-    # Message budget is defined only under context.
+    # Message budget lives under context only.
     "llm": {
         "provider": "openai",
         "model": "gpt-4o",
         "api_key_env": "OPENAI_API_KEY",
-        # Reasoning effort. Null omits the field for non-reasoning endpoints.
+        # Null for non-reasoning endpoints.
         "reasoning_effort": None,
     },
     "sandbox": {"provider": "local"},
@@ -42,20 +37,16 @@ DEFAULTS = {
     ],
     "evaluator": {"type": "command", "test_cmd": "python -m pytest tests/ -q"},
     "logging": {"type": "jsonl", "path": "logs/mantra-run.jsonl"},
-    # Interactive defaults use the strictest approval mode.
+    # Strictest approval for interactive use.
     "approvals": "default",  # default | auto | yolo | plan
     "context": {"max_messages": 200, "max_chars": 240000},
-    "auto_compact_tokens": 60000,  # summarise the history past this size; 0 disables
-    "verbose": False,  # echo truncated tool output as it arrives
-    # Use native terminal scrollback and mouse selection in the console.
-    # Set false to opt into the fixed framed layout.
+    "auto_compact_tokens": 60000,  # compact when history exceeds; 0 disables
+    "verbose": False,  # echo truncated tool output live
+    # True uses native scrollback; false uses fixed frame.
     "native_scrollback": True,
     "skills": {
-        # Attach a matching skill to a plain prompt without being asked.
-        # Off still leaves /skills fully usable by hand.
+        # Auto-attach skill per turn; bundles only suggested as hints.
         "auto": True,
-        # A bundle runs several agent turns, which is too much to start on
-        # a guess, so a matching bundle is only ever offered as a hint.
         "auto_bundle": False,
     },
 }
@@ -78,7 +69,10 @@ def load_config(path: str) -> dict:
         raw = handle.read(_MAX_CONFIG_BYTES + 1)
     if len(raw) > _MAX_CONFIG_BYTES:
         raise ConfigError(f"config file too large (exceeds {_MAX_CONFIG_BYTES} bytes)")
-    if path.lower().endswith((".yaml", ".yml")):
+    # Empty file is valid: treat as empty config for consistent behavior.
+    if not raw.strip():
+        data = {}
+    elif path.lower().endswith((".yaml", ".yml")):
         data = _load_yaml(raw)
     else:
         data = _load_json(raw)
@@ -96,20 +90,14 @@ def _deep_merge(base: dict, incoming: dict) -> dict:
 
 
 def merge_defaults(data: dict) -> dict:
-    # Deep, not shallow: a shallow copy leaves the nested sections - llm,
-    # skills, tools - shared with DEFAULTS, so a session setting its model
-    # would silently rewrite the module defaults and every config loaded
-    # afterwards in this process would inherit the change.
+    # Deep copy prevents mutation of shared DEFAULTS.
     merged = copy.deepcopy(DEFAULTS)
     for key, value in (data or {}).items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _deep_merge(merged[key], value)
         else:
             merged[key] = copy.deepcopy(value) if isinstance(value, (dict, list)) else value
-    # Presence alone says nothing: these keys are always present because
-    # the defaults supply them. A section explicitly set to null, or a
-    # tool list that is a string, used to sail through and then fail
-    # with an attribute error deep inside assembly.
+    # Validate required sections; defaults always supply keys.
     required = ("llm", "sandbox", "evaluator")
     wrong_type = [
         key for key in required if not isinstance(merged.get(key), dict)

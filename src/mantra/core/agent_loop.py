@@ -1,14 +1,4 @@
-"""Stateful orchestrator. Uses dependency injection and interacts only with interfaces.
-
-Three hooks let a front end turn one-shot grading into an interactive tool
-without the core learning anything about terminals:
-
-    context   reuse one :class:`ContextManager` so the model remembers
-              earlier turns instead of starting fresh every message
-    abort     a :class:`threading.Event` checked between steps and inside
-              the streaming callback, so Ctrl+C stops the run cleanly
-    approver  consulted before every mutating tool call
-"""
+"""Orchestrator with injected deps; hooks for context, abort, approval."""
 
 from __future__ import annotations
 
@@ -28,17 +18,17 @@ from mantra.interfaces.sandbox import Sandbox
 from mantra.interfaces.tool import Tool
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You already know where you are — workspace path, file list, and README are in Environment. "
-    "Never ask for GitHub link.\n\n"
-    "For any project description, verify with list_dir and README, then summarize the real project.\n\n"
-    "You are a senior engineer for any task — coding, docs, analysis, research. Be tool-first and evidence-backed: "
-    "inspect real files before answering, deliver correct minimal solutions, never hallucinate. If unsure, say so. Be direct, no fluff."
+    "You are a senior engineer and universal solver. Deliver correct, minimal, verified results for any task — "
+    "coding, analysis, research, writing. Never hallucinate APIs, facts, or syntax; if unsure, say \"I don't know.\" "
+    "Be direct, no fluff. Use Environment for workspace context — answer without tools when possible. "
+    "For complex work: explore, plan, act, verify. Batch tools in one turn (list_dir + read_file), "
+    "never repeat the same call, read before edit, confirm with tests before finishing."
 )
 
 
 @dataclass
 class RunResult:
-    """Everything worth keeping from one agent run."""
+    """Result of one run: verdict, steps, timing, metrics."""
 
     task_id: str
     passed: bool
@@ -51,7 +41,7 @@ class RunResult:
 
 
 class AgentLoop:
-    """Runs one task: provision sandbox -> loop -> evaluate -> cleanup."""
+    """Run one task: provision, loop, evaluate, cleanup."""
 
     def __init__(
         self,
@@ -91,7 +81,7 @@ class AgentLoop:
         context = self.context or ContextManager()
         self.context = context
         self._seed_context(context, task)
-        # Propagate abort to sandbox so exec can be interrupted mid-command.
+        # Share abort signal so sandbox exec can be interrupted.
         try:
             setattr(self.sandbox, "abort", self.abort)
         except Exception:
@@ -105,6 +95,7 @@ class AgentLoop:
         steps = 0
         aborted = False
         metrics: dict[str, float] = {"tool_errors": 0, "denied": 0}
+        recent_calls: dict[str, int] = {}
 
         try:
             self.sandbox.setup(task)
@@ -117,7 +108,7 @@ class AgentLoop:
                 response = self.llm.chat(
                     context.messages, tools=tool_schemas, on_delta=self.on_delta
                 )
-                # Validate response shape — LLM must return LLMResponse-like
+                # Response must be LLMResponse-like.
                 if response is None or not hasattr(response, "is_final"):
                     raise LLMError(f"LLM returned invalid response: {type(response).__name__}")
                 self._absorb_usage(response, metrics)
@@ -125,13 +116,12 @@ class AgentLoop:
                 if response.is_final:
                     stopped_reason = "final"
                     final_message = response.content
-                    # The answer has to reach history too, or the next turn
-                    # cannot see what was just said. Ensure content is string.
+                    # Append final answer to history for next-turn visibility.
                     content = response.content if isinstance(response.content, str) else (str(response.content) if response.content is not None else "")
                     context.append({"role": "assistant", "content": content})
                     break
 
-                # Deduplicate tool_call_ids within the same turn (LLM bug)
+                # Deduplicate tool call IDs per turn (LLM may repeat them).
                 seen_ids: set[str] = set()
                 dedup_calls = []
                 for c in response.tool_calls or []:
@@ -148,7 +138,7 @@ class AgentLoop:
                             pass
                     seen_ids.add(cid)
                     dedup_calls.append(c)
-                # Serialize arguments safely
+                # Serialize tool arguments safely.
                 tool_calls_payload = []
                 for call in dedup_calls:
                     try:
@@ -165,7 +155,7 @@ class AgentLoop:
                             },
                         }
                     )
-                # Record the assistant turn once per model reply.
+                # Record assistant turn once per reply.
                 content = response.content if isinstance(response.content, str) else (str(response.content) if response.content else "")
                 context.append(
                     {
@@ -178,7 +168,7 @@ class AgentLoop:
                 for idx, call in enumerate(dedup_calls):
                     if self.aborted:
                         stopped_reason = "aborted"
-                        # Avoid orphan: add aborted observations for remaining calls
+                        # Add aborted observations to avoid orphaned tool entries.
                         for remaining in dedup_calls[idx:]:
                             context.append(
                                 {
@@ -189,7 +179,26 @@ class AgentLoop:
                                 }
                             )
                         break
-                    observation = self._dispatch_tool(task_id, steps, call, metrics)
+                    # Block repeated identical tool calls (canonical key).
+                    try:
+                        key = f"{call.name}:{json.dumps(call.arguments, sort_keys=True, ensure_ascii=False, default=str)}"
+                    except Exception:
+                        # Fallback: sorted items for stable key.
+                        try:
+                            if isinstance(call.arguments, dict):
+                                parts = [f"{k}={v}" for k, v in sorted(call.arguments.items(), key=lambda x: str(x[0]))]
+                                key = f"{call.name}:" + ",".join(parts)
+                            else:
+                                key = f"{call.name}:{call.arguments}"
+                        except Exception:
+                            key = f"{call.name}:{type(call.arguments).__name__}"
+                    cnt = recent_calls.get(key, 0) + 1
+                    recent_calls[key] = cnt
+                    if cnt >= 2:
+                        observation = f"ERROR: you already called {call.name} {call.arguments} — result is already in history above. Do not repeat. Use it or try a different file (e.g. README.md, pyproject.toml)."
+                        metrics["tool_errors"] += 1
+                    else:
+                        observation = self._dispatch_tool(task_id, steps, call, metrics)
                     context.append(
                         {
                             "role": "tool",
@@ -255,7 +264,7 @@ class AgentLoop:
     def _dispatch_tool(
         self, task_id: str, step: int, call, metrics: dict[str, float]
     ) -> str:
-        """Approve, then execute one tool call; every failure is an observation."""
+        """Approve and execute one tool; failures become observations."""
         try:
             if self.approver is not None and not self.approver.check(call.name, call.arguments):
                 metrics["denied"] += 1
@@ -275,7 +284,7 @@ class AgentLoop:
     def _execute_tool(
         self, task_id: str, step: int, call, metrics: dict[str, float]
     ) -> str:
-        """Dispatch one tool call; every failure becomes an observation."""
+        """Execute tool; convert failures to observations."""
         tool = self.tools.get(call.name)
         if tool is None:
             metrics["tool_errors"] += 1
@@ -295,7 +304,7 @@ class AgentLoop:
             observation = f"ERROR: tool '{call.name}' failed: {exc}"
         if str(observation).startswith("ERROR"):
             metrics["tool_errors"] += 1
-        # Include observation for file-edit tools so the UI can show diffs.
+        # Include edit result so UI can show diffs.
         result_payload: dict = {
             "task_id": task_id,
             "step": step,
@@ -309,11 +318,7 @@ class AgentLoop:
         return observation
 
     def _seed_context(self, context: ContextManager, task: dict[str, Any]) -> None:
-        """First turn pins system + task; later turns append the new request.
-
-        Without this a REPL would start from scratch on every message and the
-        model could never refer to anything it did a minute ago.
-        """
+        """Seed first turn or append to existing history."""
         rendered = self._render_task(task)
         if not context.messages:
             context.seed(self.system_prompt, rendered)
@@ -327,8 +332,10 @@ class AgentLoop:
             try:
                 usage = dict(usage)  # type: ignore[arg-type]
             except Exception:
+                metrics["usage_unknown"] = metrics.get("usage_unknown", 0) + 1
                 return
             if not isinstance(usage, dict):
+                metrics["usage_unknown"] = metrics.get("usage_unknown", 0) + 1
                 return
         def _to_int(v: Any) -> int | None:
             if isinstance(v, (int, float)):

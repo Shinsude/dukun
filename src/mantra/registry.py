@@ -1,9 +1,4 @@
-"""Component registry and configuration-driven assembly.
-
-Maps short names from the config file to concrete classes. Third parties
-can extend MANTRA by registering additional classes here (or by adding
-entries in their own bootstrap code) without touching the core.
-"""
+"""Registry: map config names to classes; extend without core changes."""
 
 from __future__ import annotations
 
@@ -70,8 +65,7 @@ TOOL_REGISTRY: dict[str, type[Tool]] = {
         WebFetchTool,
     )
 }
-# Spelled without the underscore because that is how people say it
-# aloud, and a wrong name here is a confusing "unknown tool" at startup.
+# Alias without underscore for usability.
 TOOL_REGISTRY["webfetch"] = WebFetchTool
 
 
@@ -108,13 +102,7 @@ def build_logger(config: dict) -> Logger:
 
 
 def build_tools(names: list[str]) -> list[Tool]:
-    """Instantiate tools by registry name; fail loudly on unknown names.
-
-    File tools share one EditLedger instance so read-before-edit tracking
-    works across the whole tool set within a session. Duplicate names and
-    aliases that resolve to the same tool class are deduplicated to avoid
-    exposing the same capability twice.
-    """
+    """Create tools by name; share one EditLedger; dedupe aliases."""
     from mantra.implementations.tools.edit_ledger import EditLedger
 
     ledger = EditLedger()
@@ -137,11 +125,7 @@ def build_tools(names: list[str]) -> list[Tool]:
 
 
 def _construct(cls, config: dict):
-    """Build a component from its config section.
-
-    Only keys matching constructor parameters are forwarded, so sections may
-    carry documentation or future fields safely.
-    """
+    """Build component; forward only matching params."""
     params = _constructor_params(cls)
     kwargs = {}
     for key, value in config.items():

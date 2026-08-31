@@ -1,9 +1,4 @@
-"""Scripted mock client for offline testing of the harness loop.
-
-Replays a fixed list of responses, validating that requested tool calls are
-well-formed. Lets the full pipeline be verified end to end without any API
-key or network access.
-"""
+"""Mock client: replay scripted responses for offline tests."""
 
 from __future__ import annotations
 
@@ -17,7 +12,7 @@ _call_counter = 0
 
 
 class ScriptedLLMClient(LLMClient):
-    """Returns queued responses in order; raises when the script runs dry."""
+    """Return next queued response; raise when empty."""
 
     def __init__(self, script: list[LLMResponse]) -> None:
         self.script = list(script)

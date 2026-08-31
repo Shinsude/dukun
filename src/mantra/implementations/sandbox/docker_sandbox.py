@@ -1,9 +1,4 @@
-"""Docker-isolated sandbox driven by the docker CLI.
-
-Uses ``docker run``/``docker exec``/``docker cp`` through subprocess so the
-harness has no Python Docker SDK dependency. Requires the docker CLI on PATH
-and a running daemon.
-"""
+"""Container sandbox via docker CLI; one container per run."""
 
 from __future__ import annotations
 
@@ -22,7 +17,7 @@ _MAX_EXEC_BYTES = 1_000_000
 
 
 class DockerSandbox(Sandbox):
-    """One disposable container per task run."""
+    """One container per run."""
 
     def __init__(
         self,
@@ -151,19 +146,17 @@ class DockerSandbox(Sandbox):
     def _is_safe_path(self, path: str) -> bool:
         if not path or "\x00" in path or "\n" in path or "\r" in path or ":" in path:
             return False
-        # Reject absolute paths and parent traversal
-        if os.path.isabs(path):
-            return False
-        parts = path.replace("\\", "/").split("/")
-        if ".." in parts:
-            return False
-        # Ensure normalized path stays inside workdir
-        normalized = os.path.normpath(path).replace("\\", "/")
-        if normalized.startswith("../") or normalized == "..":
-            return False
-        if os.path.isabs(normalized):
-            return False
-        return True
+        # Validate fully joined container path.
+        import posixpath
+
+        joined = path if os.path.isabs(path) else posixpath.join(self.workdir, path)
+        normalized = posixpath.normpath(joined.replace("\\", "/"))
+        wd = self.workdir.rstrip("/")
+        if normalized == wd or normalized.startswith(wd + "/"):
+            if ".." in normalized.split("/"):
+                return False
+            return True
+        return False
 
     def read_file(self, path: str) -> str:
         if not self._is_safe_path(path):

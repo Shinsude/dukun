@@ -1,12 +1,11 @@
-"""Compact layout with viewport buffer, status border, and fixed bottom prompt.
-to the terminal as normal scrollback. The prompt is always the last row.
-"""
+"""Compact TUI: viewport buffer, border row, fixed prompt."""
 
 from __future__ import annotations
 
 import re
 import sys
 import threading
+import time
 from typing import Any
 
 from mantra.term import term_size as _term_size
@@ -129,10 +128,10 @@ def bottom_status(session: Any, enabled: bool = True) -> str:
     return _dim(core, enabled)
 
 
-# Keep old names for backwards compatibility
-show_splash = None  # replaced by layout.show_splash()
-hide_splash = None  # replaced by layout.hide_splash()
-draw_status = None  # replaced by layout.draw_chrome()
+# Legacy names (replaced by layout methods).
+show_splash = None
+hide_splash = None
+draw_status = None
 
 
 class CompactLayout:
@@ -149,7 +148,7 @@ class CompactLayout:
     """
 
     RESERVED_BOTTOM = 2  # border + prompt
-    RESERVED_TOP = 2      # info bar + info border
+    RESERVED_TOP = 2  # info bar + border
     MAX_LINES = 8000
 
     def __init__(self) -> None:
@@ -176,6 +175,7 @@ class CompactLayout:
         self.partial = ""
         self.offset = 0
         self._last_visible: list[str] | None = None
+        self._last_render = 0.0
 
     # ── screen lifecycle ──────────────────────────────────────
 
@@ -292,6 +292,11 @@ class CompactLayout:
             if len(self.lines) > self.MAX_LINES:
                 self.lines = self.lines[-self.MAX_LINES:]
 
+            # Throttle rapid streaming fragments.
+            now = time.monotonic()
+            if now - self._last_render < 0.05 and len(text) < 500:
+                return
+            self._last_render = now
             self._render_content_locked()
 
     def clear_content(self) -> None:
@@ -327,9 +332,9 @@ class CompactLayout:
             line = visible[i] if i < len(visible) else ""
             new_visible.append(_fit_line(line, self._cols))
 
-        # Temporarily remove scroll region to draw freely.
+        # Remove scroll region to draw freely.
         _safe_write("\033[r")
-        # Synchronized output — prevent flicker on fast redraws.
+        # Synchronized output prevents flicker.
         if _sync:
             _safe_write("\033[?2026h")
         try:
@@ -339,7 +344,7 @@ class CompactLayout:
                     row = self.content_top + i
                     _safe_write(f"\033[{row};1H\033[2K{line}")
             else:
-                # Dirty-row repaint — only redraw changed rows.
+                # Only redraw changed rows.
                 for i, line in enumerate(new_visible):
                     if line != self._last_visible[i]:
                         row = self.content_top + i
@@ -353,18 +358,12 @@ class CompactLayout:
         self._apply_region_locked()
 
     def restore_popup_rows(self, count: int) -> None:
-        """Repaint the host frame underneath a completion popup.
-
-        Popup rows temporarily cover the bottom of the conversation and the
-        divider. Repainting the retained viewport from absolute screen rows is
-        deliberately idempotent: every selection change starts from the exact
-        same underlying frame, so terminal scroll state cannot accumulate.
-        """
+        """Repaint frame under popup; idempotent to avoid scroll drift."""
         with _UI_LOCK:
             if not self.active or self._last_visible is None or count <= 0:
                 return
 
-            # Repaint the full viewport — simpler and handles all edge cases.
+            # Full repaint handles all edge cases.
             self._render_content_locked()
 
     # ── scroll ────────────────────────────────────────────────
@@ -392,7 +391,7 @@ class CompactLayout:
     # ── chrome ────────────────────────────────────────────────
 
     def _draw_info_bar_locked(self) -> None:
-        """Draw the top info bar with workspace, model, approval, cache hit rate."""
+        """Draw top info bar: workspace, model, approval, cache rate."""
         if not self.active:
             return
         enabled = getattr(self._style, "enabled", True)
@@ -411,7 +410,7 @@ class CompactLayout:
         # Approval mode.
         approval = getattr(getattr(self._session, "approvals", None), "mode", "auto") if self._session else "auto"
 
-        # Cache hit rate from session totals.
+        # Cache hit rate from totals.
         cache_hit = 0
         tokens_in = 0
         if self._session and hasattr(self._session, "totals"):
@@ -422,7 +421,7 @@ class CompactLayout:
         else:
             rate = "—"
 
-        # Model display with reasoning, always shown so a mid-session /model change is visible instantly
+        # Show model+effort so mid-session changes are visible.
         model_display = f"{model} ({reasoning})"
         items = []
         if st and enabled:
@@ -436,14 +435,14 @@ class CompactLayout:
             items.append(f"APPROVAL: {approval}")
             items.append(f"CACHE: {rate}")
 
-        # Join with separators.
+        # Join items with separators.
         sep = _grey(" │ ", enabled)
         info = sep.join(items)
         info = _fit_line(info, self._cols)
 
         _safe_write(f"\033[{self.info_row};1H\033[2K{info}")
 
-        # Info border line.
+        # Info border.
         border = _grey("─" * max(0, self._cols), enabled)
         _safe_write(f"\033[{self.info_border_row};1H\033[2K{border}")
 
@@ -458,17 +457,17 @@ class CompactLayout:
 
         _safe_write("\033[r")
 
-        # Draw top info bar.
+        # Top info bar.
         self._draw_info_bar_locked()
 
-        # Clear border row (second-to-last row).
+        # Clear border row.
         _safe_write(f"\033[{self.border_row};1H\033[2K")
 
         # Border line.
         border = _grey("─" * max(0, self._cols), enabled)
         _safe_write(f"\033[{self.border_row};1H{border}")
 
-        # Prompt is owned exclusively by LineEditor — do not draw here to avoid duplication
+        # Prompt owned by LineEditor; skip here.
 
         sys.stdout.flush()
         self._apply_region_locked()

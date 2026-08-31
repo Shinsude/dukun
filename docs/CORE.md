@@ -19,4 +19,3 @@ The approval module classifies each tool invocation into safe, mutating, or dest
 ## Events and Exceptions
 
 The event bus provides synchronous fan-out to subscribed handlers and suppresses handler exceptions to isolate observers from the run. The exceptions module defines a hierarchy with distinct types for harness, configuration, tool, sandbox, language-model, evaluation, and abort conditions, allowing the orchestrator to distinguish operator interruption from other failures.
-

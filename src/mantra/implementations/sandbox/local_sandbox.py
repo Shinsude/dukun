@@ -1,8 +1,4 @@
-"""Sandbox that executes directly in a host working directory.
-
-No isolation: intended for trusted local development and testing.
-The Docker sandbox is the isolated counterpart for real agent runs.
-"""
+"""Host sandbox: executes in workspace dir, no isolation."""
 
 from __future__ import annotations
 
@@ -16,10 +12,7 @@ import time
 from mantra.core.exceptions import AbortError, SandboxError
 from mantra.interfaces.sandbox import ExecResult, Sandbox
 
-# Patterns that likely indicate an attempt to access paths outside the
-# workspace through the shell. This is a best effort mitigation for the
-# local directory sandbox, which is documented as not a security boundary.
-# Strong isolation should use the container sandbox.
+# Heuristic patterns for shell traversal; best effort, not a boundary.
 _TRAVERSAL_RE = re.compile(r"(\.\.[\\/]|[\\/]\.\.)")
 _ABSOLUTE_WIN_RE = re.compile(r"[a-zA-Z]:[\\/]")
 
@@ -28,14 +21,7 @@ _MAX_EXEC_BYTES = 1_000_000
 
 
 def _contains_traversal(command: str) -> bool:
-    """Heuristic check for shell commands that likely escape the workspace.
-
-    This blocks simple traversal like ``../`` or ``..\\`` and absolute paths
-    such as ``C:\\`` or ``/etc`` when they appear as file arguments. It is
-    intentionally conservative and may block some legitimate commands that
-    explicitly reference parent directories, which is the desired behaviour
-    for the local sandbox.
-    """
+    """Heuristic: does command likely escape workspace?"""
     if not command:
         return False
     # Skip checks for URL like strings inside the command to avoid
@@ -224,12 +210,11 @@ class LocalSandbox(Sandbox):
         parent = os.path.dirname(full)
         if parent:
             os.makedirs(parent, exist_ok=True)
-            # Re-validate after makedirs to mitigate TOCTOU symlink swap
+            # Re-validate after makedirs; narrow TOCTOU window.
             real_parent = os.path.realpath(parent)
             real_base = os.path.realpath(self.root)
             if not (real_parent == real_base or real_parent.startswith(real_base + os.sep)):
                 raise SandboxError(f"path escapes sandbox workspace: {path}")
-            # Additional component-wise symlink check to narrow race window
             cur = parent
             while cur and cur != real_base and cur.startswith(real_base):
                 if os.path.islink(cur):
@@ -238,11 +223,14 @@ class LocalSandbox(Sandbox):
                 if nxt == cur:
                     break
                 cur = nxt
-            # Also re-resolve full path after parent creation
             full = self._resolve(path)
-            # Atomic write via temp file to avoid partial writes
-        # Use atomic tmp+replace to reduce race
+            # Reject symlink target.
+            if os.path.islink(full) or os.path.islink(parent):
+                raise SandboxError(f"path escapes sandbox workspace: {path}")
+        # Atomic tmp+replace; ensure tmp not symlink.
         tmp = full + ".tmp"
+        if os.path.islink(tmp):
+            raise SandboxError(f"path escapes sandbox workspace: {path}")
         try:
             with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)

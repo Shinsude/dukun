@@ -1,17 +1,4 @@
-"""A keyboard- and mouse-driven menu for the MANTRA TUI.
-
-Every slash command with children - models, reasoning effort, approval
-mode - opens one of these rather than asking the operator to type a
-number. Arrow keys and the mouse both move the highlight; Enter or a
-click selects; Esc cancels.
-
-Long catalogues are filterable by typing, because an OpenRouter account
-can list hundreds of models and nobody scrolls that far.
-
-Standard library only. Mouse reporting is switched on only while a menu
-is open and always switched off again, so selecting text in the
-scrollback keeps working everywhere else.
-"""
+"""Menu: keyboard/mouse, filterable, mouse-aware."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Append-only JSONL event logger."""
+"""JSONL logger: append-only, never raises."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from mantra.interfaces.logger import Logger
 
 
 class JsonlLogger(Logger):
-    """Writes one JSON object per line; never raises into the caller."""
+    """One JSON per line; never raises."""
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -23,11 +23,48 @@ class JsonlLogger(Logger):
 
     def log(self, event: str, payload: dict[str, Any]) -> None:
         record = {"ts": round(time.time(), 3), "event": event, **payload}
+        line = json.dumps(record, default=str) + "\n"
+        # Inter-process lock to avoid interleaved lines.
+        lock_path = self.path + ".lock"
+        # Brief stale handling.
         try:
-            with self._lock, open(self.path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, default=str) + "\n")
+            age = time.time() - os.path.getmtime(lock_path)
+            if age >= 5.0:
+                try:
+                    os.remove(lock_path)
+                except OSError:
+                    pass
         except OSError:
-            pass  # observability must never break a run
+            pass
+        acquired = False
+        fd = None
+        start = time.monotonic()
+        while time.monotonic() - start < 0.5:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                acquired = True
+                break
+            except FileExistsError:
+                time.sleep(0.02)
+            except OSError:
+                break
+        try:
+            with self._lock:
+                try:
+                    with open(self.path, "a", encoding="utf-8") as handle:
+                        handle.write(line)
+                except OSError:
+                    pass
+        finally:
+            if acquired and fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.remove(lock_path)
+                except OSError:
+                    pass
 
     def close(self) -> None:
         pass

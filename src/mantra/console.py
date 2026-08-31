@@ -1,23 +1,4 @@
-"""MANTRA TUI - a Grok-style terminal interface for the coding agent.
-
-Pure standard library: ANSI escape codes (enabled for Windows consoles via
-the VT workaround), a braille spinner while the model works, dim tool-trace
-lines, markdown-lite rendering of replies, token-level streaming, and a
-bordered container that each turn is written into (see
-``container.py``).
-
-Run:
-    python console.py                          examples/config.json + ./workspace
-    python console.py --workspace D:\\myrepo    operate on any repository
-    python console.py --once "do something"    single message, then exit
-    python console.py --plain                  no ANSI styling (redirects, logs)
-    python console.py --approve yolo           skip every confirmation
-
-Commands:
-  /help /workspace /memory /diff /undo /tools /model /connect /approve
-  /cost /compact /clear /reset /save /load /resume /goal /skills /workflow /paste /steps /verbose /exit
-Anything else you type is sent to the agent as a task.
-"""
+"""Interactive console: ANSI, spinner, markdown, streaming. Stdlib only."""
 
 from __future__ import annotations
 
@@ -75,7 +56,7 @@ from mantra.line_editor import Completion, LineEditor
 import mantra.compact as compact
 from mantra.registry import build_llm, build_tools
 
-# Local helpers (container/dashboard removed — compact is sole TUI)
+# Compact is sole TUI.
 _WRITE_LOCK = threading.Lock()
 from mantra.term import visible_len  # shared wide-aware impl (line_editor/compact/term)
 _ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
@@ -682,7 +663,7 @@ class ConsoleSession:
         self._abort = threading.Event()
         self._prev_sigint = None
 
-    # ---- frame compat (no-ops — compact has no Frame) --------------
+    # Compat shims: deprecated, no-op (compact is sole TUI).
 
     def open_frame(self) -> bool:
         return False
