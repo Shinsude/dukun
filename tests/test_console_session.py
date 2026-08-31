@@ -368,7 +368,7 @@ class MentionTest(unittest.TestCase):
     def test_directory_mention_lists_entries(self):
         expanded, attached = self.expand("what is in @src?")
         self.assertEqual(attached, ["src"])
-        self.assertIn("(directory,", expanded)
+        self.assertIn("@SRC", expanded)
         self.assertIn("util.py", expanded)
 
     def test_glob_mention_attaches_matches(self):
@@ -407,7 +407,7 @@ class MentionTest(unittest.TestCase):
     def test_duplicate_mentions_attach_once(self):
         expanded, attached = self.expand("compare @app.py and @app.py")
         self.assertEqual(attached, ["app.py"])
-        self.assertEqual(expanded.count("--- @app.py ---"), 1)
+        self.assertEqual(expanded.count("* @APP.PY *"), 1)
 
     def test_large_files_are_truncated(self):
         big = os.path.join(self.workspace, "big.txt")
@@ -415,7 +415,7 @@ class MentionTest(unittest.TestCase):
             handle.write("z" * 40_000)
         expanded, attached = self.expand("summarise @big.txt")
         self.assertEqual(attached, ["big.txt"])
-        self.assertIn("[truncated]", expanded)
+        self.assertIn("* [truncated]", expanded)
         self.assertLess(expanded.count("z"), 40_000)
 
 

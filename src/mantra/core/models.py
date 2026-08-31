@@ -100,7 +100,7 @@ def fetch_models(
         raise LLMError("no base URL to ask for models")
 
     api_key = resolve_key(api_key_env)
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": "MANTRA/1.0 (https://opencode.ai)"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 

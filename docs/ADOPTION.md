@@ -1,95 +1,42 @@
-# HARNESSY adoption report - what MANTRA should take, and what to leave
+# Adoption Report — What Was Carried Over and What Was Left
 
-Source: full scan of `C:\Users\arif-\HARNESSY` (workflow-layer repo: 60+
-PowerShell scripts, 47 skills, 112 test files, hook/orchestrator stack,
-`.grok` state directory). Filter applied: adopt only what a solo daily-driver
-coding agent needs; everything must earn its bytes.
+The system adopts selected ideas from a larger workflow-layer harness that provides many scripts, skills, and state management. The filter applied was to adopt only what a solo daily-driver coding agent needs, with every addition required to earn its place in terms of complexity and maintenance cost.
 
-## Adopt now (three small features, outsized power)
+## Adopted
 
-### 1. Read-before-edit ledger (from scripts/read-safe.ps1 + anchor-edit.ps1)
+### Read-Before-Edit Ledger
 
-HARNESSY requires a recorded fresh read (SHA-256) before any file edit and
-rejects edits whose anchor no longer matches ("stale old_string", incident
-class C15). This is their most battle-tested guard - it exists because models
-edit files they never read, or edit against outdated content.
+The source harness requires a recorded fresh read before any file edit and rejects edits whose anchor no longer matches the on-disk content. This is carried over as an in-memory per-session ledger that records a content hash on each read and write, enforces the invariant in the edit tool, rejects edits to truncated content, and reports a clear message when the file changed since the last read. The ledger uses normalized path keys so the same file written with different separators is recognized.
 
-Port as roughly 50 lines inside MANTRA's EditFileTool: keep a per-run dict of
-path -> sha256(content) written by read_file; edit_file recomputes the hash
-first and fails with "file changed since last read - re-read it" on mismatch.
-No subprocess, no ledger directory (in-memory per run).
+### Known-Failure Registry
 
-### 2. Known-failure registry (from .grok/known-failures.md)
+Every recurring incident class is recorded as an entry with symptom, rule, and date. The registry is appended to the system prompt on every session so fixed classes stay fixed. New entries are added when a class is fixed and are accompanied by regression tests that lock the fix.
 
-Their highest-leverage process artifact: every recurring incident becomes an
-entry (symptom / fix / probe / date) that is re-read before every task so a
-fixed bug class cannot silently return in sibling code. Entries there follow
-the KF-N format with pinned regression tests.
+### Durable Workspace Memory with Cap
 
-Port as a plain markdown list at knowledge/known-failures.md, appended to the
-system prompt automatically by console and main. When a bug class is fixed,
-one line gets added. Cost: one file plus ~10 lines of loader.
+Project state is kept per workspace in a hidden directory and appended after each turn. The memory file is capped to prevent unbounded growth, with oldest lines pruned first and single-line oversize content truncated to the cap. The tail is loaded into the system prompt, and locking with stale-lock handling protects concurrent appends. Environment facts, instruction files, and repository head are injected alongside the memory.
 
-### 3. Durable workspace memory, capped (from .grok/memory.md + recall-digest.md)
+### Session Persistence and Resumption
 
-HARNESSY keeps project state in memory.md and auto-loads a distilled
-recall-digest.md each session. Powerful - but their memory.md has grown to
-117 KB, which is the bloat failure mode to avoid copying.
+Automatically saved transcripts allow a session to be resumed after closing the window. Each transcript records version, name, timestamp, workspace, model, summary, totals, goals, and the full message list with per-message size caps. Transcripts are written atomically with restricted permissions, listed newest first, and corrupted files are skipped rather than blocking the entire list.
 
-Port as MANTRA/knowledge/memory.md with a hard cap (about 8 KB): newest
-entries first, prune rule "keep only what changes a future decision". The
-console loads the tail into the system prompt; after each completed task the
-agent appends a two-line summary (what changed / where it left off).
+### Approval Policy
 
-## Adopt next (two, when needed)
+A daily-driver agent needs a gate between a requested tool and an executed action. The adopted policy classifies each tool invocation as safe, mutating, or destructive via pattern matching and offers four modes that differ in which categories are auto-allowed. Affirmative answers can be remembered for the remainder of the session on a per-tool-key basis.
 
-### 4. Enforced self-verify before finishing (from .grok/verify.cmd concept)
+### Turn-Aware Context Management
 
-HARNESSY never declares work done without running its aggregate gate. MANTRA
-already grades tasks via test_cmd; extend AgentLoop so that when the model
-says "done" but the task defines test_cmd, the harness runs it once and feeds
-a failure back as an observation instead of ending the run. Roughly 15 lines
-in the loop; turns evaluator from judge into coach.
+Conversation history is bounded and turn-aware, preserving the initial system prompt and task while dropping the oldest complete turn first to avoid orphaned tool results, with fallbacks and truncation handling that were refined to validate limits and bound single-message growth.
 
-### 5. Session digest (replaces their monitor/analytics/grok-analyzer family)
+## Adopted Later
 
-They run several large scripts over a unified event log. MANTRA already writes
-logs/*.jsonl; a single ~80-line summarizer (tasks, pass rate, steps per task,
-tool error rate, slowest tools) delivers most of the insight. Add only when
-you actually want to inspect agent behavior trends.
+Enforced self-verification before finishing and a lightweight session digest were adopted in a minimal form. The orchestrator ensures an evaluation is always produced even after errors, and the structured log provides pass rates, step counts, tool error rates, and token usage without requiring additional services. Automatic summarization of the conversation is available when the token threshold is exceeded.
 
-## Leave behind (bloat for this use case)
+## Deliberately Left Behind
 
-- Orchestrator + hook stack (orchestrator.ps1, hooks/, pre-tool-use evaluators):
-  host-level permission plumbing; MANTRA's sandbox boundary plus your judgment
-  cover the same need without a second enforcement layer.
-- Swarm/subagent skills (swarm, subagent-dev, panel): multi-agent fan-out is
-  power without a consumer yet.
-- Vault integrity chain (vault-*.ps1), deploy-parity, backup-config: designed
-  for a repo deployed to a live installation; MANTRA is a folder you move.
-- Evaluation stack (eval-fixtures, trajectory-grade, judge-validate,
-  cost-per-change, blast-gate): research tooling for tuning the harness itself;
-  revisit if MANTRA becomes a product.
-- Mining family (mine-sessions, mine-chat-history, session-watch, metrics):
-  depends on Grok host log formats.
-- 40+ document/output skills (slides, excel, copy, humanize, design...):
-  prompt libraries for the host LLM, not harness features.
-- ide/mcp subtree: a separate Node client-facing add-on.
-- Statusline, cron/queue runners, headless runner, skill linting pipeline:
-  host lifecycle features.
+Host-level orchestration and permission plumbing, multi-agent fan-out, integrity chains for deployment to a live installation, research-oriented evaluation stacks, session-mining families that depend on host log formats, document-generation skill libraries, and other host lifecycle features were left behind. They address needs that do not apply to a folder-based harness that is moved rather than deployed, and their cost exceeds their benefit for the current use case. Host capabilities such as task tracking, subagents, and plan mode are used via habits rather than copied as files.
 
-## From the Grok host side (not portable, use via habits)
+## Current State After Remediation
 
-Todo tracking, subagents, browser verification, and plan mode are host
-capabilities, not files to copy. The transferable ideas are behavioral and are
-covered by items 1-4 above: verify claims against evidence, fail loudly on
-missing input, re-read before editing, and record durable lessons.
+Following the recent remediation, the adopted features now include hardened path confinement at every file and command boundary, owner-only permissions for staged container files, bounded streaming and memory handling, and validated configuration limits. The suite of adopted ideas remains small, test-locked, and free of host-specific dependencies, preserving the original goal of a personal daily driver that is easy to move and easy to reason about.
 
-## Suggested order
-
-1. Items 1+2+3 together (one small change set: tools hardening + knowledge dir).
-2. Item 4 once you notice the agent declaring done with failing tests.
-3. Item 5 when logs get interesting.
-
-Everything else: deliberately not adopted. Revisit this list if MANTRA grows
-beyond a personal daily driver.

@@ -35,7 +35,7 @@ from mantra.term import raw_mode, visible_len  # noqa: F401
 _MOUSE_ON = "\033[?1000h\033[?1006h"
 _MOUSE_OFF = "\033[?1000l\033[?1006l"
 
-_SGR_MOUSE = re.compile(r"^<(\d+);(\d+);(\d+)([Mm])$")
+_SGR_MOUSE = re.compile(r"<(\d+);(\d+);(\d+)([Mm])")
 
 KEY_UP = "key:up"
 KEY_DOWN = "key:down"
@@ -106,6 +106,8 @@ class Menu:
         allow_filter: bool = True,
         cursor: int = 0,
         frame: Any = None,
+        allow_delete: bool = False,
+        on_delete: Any = None,
     ) -> None:
         self.style = style
         self.title = title
@@ -121,6 +123,9 @@ class Menu:
         self.frame = frame
         # Measured once, on the first draw: see _cursor_row.
         self._row_base_auto: int | None = None
+        self.allow_delete = allow_delete
+        self.on_delete = on_delete
+        self._deleted: str | None = None
 
     # ---- public API ------------------------------------------------------
 
@@ -146,14 +151,25 @@ class Menu:
             with self._raw_mode():
                 drawn = self._draw(drawn)
                 while True:
-                    key = self._read_key()
+                    try:
+                        key = self._read_key()
+                    except KeyboardInterrupt:
+                        return None
                     result = self._handle(key)
                     if result is not None:
                         return result
                     drawn = self._draw(drawn)
+        except KeyboardInterrupt:
+            return None
         finally:
-            sys.stdout.write(_MOUSE_OFF)
-            self._finish(drawn)
+            try:
+                sys.stdout.write(_MOUSE_OFF)
+            except Exception:
+                pass
+            try:
+                self._finish(drawn)
+            except Exception:
+                pass
 
     # ---- state -----------------------------------------------------------
 
@@ -170,6 +186,27 @@ class Menu:
     def _handle(self, key: str) -> str | None:
         """Return a value to finish, or None to keep going."""
         matches = self.matches
+        # 'd' to delete highlighted item (only when not filtering and allow_delete)
+        if self.allow_delete and key in ("d", "D") and not self.query:
+            if matches and 0 <= self.cursor < len(matches):
+                target = matches[self.cursor]
+                # Don't delete the special add-entry
+                if target.value.startswith("+"):
+                    return None
+                if self.on_delete:
+                    try:
+                        self.on_delete(target.value)
+                    except Exception:
+                        pass
+                # Remove from options list
+                self.options = [o for o in self.options if o.value != target.value]
+                self._deleted = target.value
+                if self.cursor >= len(self.matches):
+                    self.cursor = max(0, len(self.matches) - 1)
+                # If nothing left, cancel
+                if not self.options or all(o.value.startswith("+") for o in self.options):
+                    return ""
+                return None
         if key == KEY_UP:
             self.cursor = max(0, self.cursor - 1)
             return None
@@ -504,6 +541,8 @@ def choose(
     allow_filter: bool = True,
     cursor: int = 0,
     frame: Any = None,
+    allow_delete: bool = False,
+    on_delete: Any = None,
 ) -> str | None:
     """Convenience wrapper: build a menu from anything and pick from it."""
     return Menu(
@@ -515,4 +554,6 @@ def choose(
         allow_filter=allow_filter,
         cursor=cursor,
         frame=frame,
+        allow_delete=allow_delete,
+        on_delete=on_delete,
     ).pick()

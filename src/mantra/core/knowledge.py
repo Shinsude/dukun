@@ -38,11 +38,7 @@ def find_instructions_file(workspace: str) -> str | None:
 
 
 def render_environment(workspace: str) -> str:
-    """Facts about the host and checkout, so the model stops guessing.
-
-    A model that knows it is on Windows with PowerShell available writes
-    working commands instead of Unix ones it hallucinated. Cheap to build
-    once per session, and it removes a whole class of failed turns.
+    """Collect host and workspace facts so the model uses correct commands for the current platform.
     """
     lines = [
         f"- date: {time.strftime('%Y-%m-%d')}",
@@ -152,7 +148,12 @@ def assemble_system_prompt(
             + instr_text.strip()
         )
 
-    return "\n\n".join(sections)
+    result = "\n\n".join(sections)
+    # Total cap to prevent context blow-up (base + caps could exceed 20k)
+    TOTAL_CAP = 20000
+    if len(result) > TOTAL_CAP:
+        result = result[:TOTAL_CAP] + "\n... [truncated]"
+    return result
 
 
 def _read_capped(path: str | None, cap: int) -> str:
@@ -197,7 +198,8 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
         while len(combined) > cap:
             lines = combined.split("\n")
             combined = "\n".join(lines[1:])
-            if "\n" not in combined:
+            if "\n" not in combined and len(combined) > cap:
+                combined = combined[-cap:]
                 break
         parent = os.path.dirname(memory_path)
         if parent:
@@ -240,7 +242,8 @@ def append_memory(memory_path: str | None, text: str, cap: int = MEMORY_CAP_CHAR
                     while len(combined) > cap:
                         lines = combined.split("\n")
                         combined = "\n".join(lines[1:])
-                        if "\n" not in combined:
+                        if "\n" not in combined and len(combined) > cap:
+                            combined = combined[-cap:]
                             break
             tmp_path = memory_path + ".tmp"
             try:

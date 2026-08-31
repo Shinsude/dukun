@@ -134,7 +134,7 @@ class Screen:
     absolute cursor moves - to know where text actually lands.
     """
 
-    CSI = re.compile(r"\033\[([0-9;]*)([A-Za-z])")
+    CSI = re.compile(r"\033\[([?0-9;]*)([A-Za-z])")
 
     def __init__(self, columns: int = 80, rows: int = 24):
         self.columns = columns
@@ -151,8 +151,11 @@ class Screen:
                 self._write(data[index:])
                 return
             self._write(data[index : match.start()])
-            count = int(match.group(1)) if match.group(1) else 1
-            self._csi(match.group(2), count)
+            params = match.group(1)
+            # Skip synchronized output sequences (start with ? or >)
+            if not params.startswith("?") and not params.startswith(">"):
+                count = int(params) if params else 1
+                self._csi(match.group(2), count)
             index = match.end()
 
     def _write(self, text: str) -> None:

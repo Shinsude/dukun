@@ -1,13 +1,4 @@
-"""Conversation history with bounded, turn-aware growth.
-
-Keeps the system prompt and the first task message pinned, then drops the
-oldest complete turn first when the budget is exceeded, so the model never
-loses its instructions and never sees orphaned tool results.
-
-A "turn" is one assistant message plus every tool result that answers it.
-Dropping anything less leaves a ``tool`` message whose ``tool_call_id`` has
-no matching call, which chat-completions servers reject outright.
-"""
+"""Bounded conversation history. Pins system prompt and first task, drops oldest complete turn first to avoid orphaned tool results."""
 
 from __future__ import annotations
 
@@ -37,6 +28,8 @@ class ContextManager:
     def __init__(self, max_messages: int = 200, max_chars: int = 240_000) -> None:
         if max_messages < 4:
             raise ValueError("max_messages must be at least 4")
+        if not isinstance(max_chars, int) or max_chars < 2000:
+            raise ValueError("max_chars must be an integer >= 2000")
         self.max_messages = max_messages
         self.max_chars = max_chars
         self.messages: list[dict[str, Any]] = []
@@ -50,6 +43,15 @@ class ContextManager:
         self._recount()
 
     def append(self, message: dict[str, Any]) -> None:
+        # Truncate oversized single message before appending.
+        size = _message_size(message)
+        if size > self.max_chars:
+            truncated = dict(message)
+            content = truncated.get("content")
+            if isinstance(content, str) and len(content) > self.max_chars:
+                truncated["content"] = content[: self.max_chars] + "\n... [truncated]"
+                size = _message_size(truncated)
+            message = truncated
         self.messages.append(message)
         self._chars += _message_size(message)
         self._truncate()
@@ -63,10 +65,14 @@ class ContextManager:
         system = (
             self.messages[0]
             if self.messages and self.messages[0].get("role") == "system"
-            else {"role": "system", "content": ""}
+            else {"role": "system", "content": "You are a helpful assistant."}
         )
+        # Ensure system content is non-empty (LLM requirement)
+        if not system.get("content"):
+            system = {"role": "system", "content": "You are a helpful assistant."}
         self.messages = [system] + list(messages)
         self._recount()
+        self._truncate()
 
     def resync(self) -> None:
         """Recompute cached sizes after messages were edited in place."""
@@ -83,6 +89,19 @@ class ContextManager:
     def _truncate(self) -> None:
         while self._over_budget() and self._drop_oldest_turn():
             pass
+        # Still over budget: truncate the largest recent message.
+        if self._over_budget() and len(self.messages) > 2:
+            largest_idx = max(range(2, len(self.messages)), key=lambda i: _message_size(self.messages[i]))
+            msg = self.messages[largest_idx]
+            content = msg.get("content")
+            if isinstance(content, str) and len(content) > 1000:
+                truncated = dict(msg)
+                truncated["content"] = content[: max(0, self.max_chars // 2)] + "\n... [truncated]"
+                self.messages[largest_idx] = truncated
+                self._recount()
+                # Recurse once if still over
+                if self._over_budget():
+                    self._truncate()
 
     def _over_budget(self) -> bool:
         return len(self.messages) > self.max_messages or self._chars > self.max_chars
@@ -98,10 +117,13 @@ class ContextManager:
             del self.messages[index:end]
             self._recount()
             return True
-        # No assistant turn left to drop: fall back to oldest non-tool message to avoid orphaning tool results.
+        # No assistant turn left to drop: fall back to oldest non-tool message
         for index in range(2, len(self.messages)):
             if self.messages[index].get("role") != "tool":
                 del self.messages[index]
+                # If next message is now an orphan tool, remove it too
+                if index < len(self.messages) and self.messages[index].get("role") == "tool":
+                    del self.messages[index]
                 self._recount()
                 return True
         # Only tool messages remain — remove the oldest tool as last resort

@@ -13,6 +13,7 @@ from mantra.interfaces.tool import Tool
 _SHELL_META_RE = re.compile(r"[;&|`$()<>]")
 
 _MAX_READ_CHARS = 20000
+_MAX_WRITE_CHARS = 1_000_000
 
 
 class ReadFileTool(Tool):
@@ -29,7 +30,12 @@ class ReadFileTool(Tool):
     ledger = None  # EditLedger, injected by the registry
 
     def execute(self, sandbox: Sandbox, path: str) -> str:
-        content = sandbox.read_file(path)
+        if "\x00" in path or "\n" in path or "\r" in path:
+            return "ERROR: invalid path"
+        try:
+            content = sandbox.read_file(path)
+        except Exception as exc:  # noqa: BLE001 - return as observation
+            return f"ERROR: cannot read {path}: {exc}"
         if self.ledger is not None:
             self.ledger.remember(path, content)
         if len(content) > _MAX_READ_CHARS:
@@ -52,7 +58,16 @@ class WriteFileTool(Tool):
     ledger = None  # EditLedger, injected by the registry
 
     def execute(self, sandbox: Sandbox, content: str, path: str) -> str:
-        sandbox.write_file(path, content)
+        if "\x00" in path or "\n" in path or "\r" in path:
+            return "ERROR: invalid path"
+        if not isinstance(content, str):
+            content = str(content)
+        if len(content) > _MAX_WRITE_CHARS:
+            return f"ERROR: content too large ({len(content)} > {_MAX_WRITE_CHARS})"
+        try:
+            sandbox.write_file(path, content)
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR: cannot write {path}: {exc}"
         if self.ledger is not None:
             self.ledger.remember(path, content)
         return f"OK: wrote {len(content)} chars to {path}"
@@ -79,7 +94,18 @@ class EditFileTool(Tool):
     def execute(
         self, sandbox: Sandbox, path: str, old_string: str, new_string: str
     ) -> str:
-        content = sandbox.read_file(path)
+        if "\x00" in path or "\n" in path or "\r" in path:
+            return "ERROR: invalid path"
+        if old_string == "":
+            return "ERROR: old_string must be non-empty"
+        if len(old_string) > _MAX_READ_CHARS or len(new_string) > _MAX_WRITE_CHARS:
+            return "ERROR: old_string or new_string too large"
+        try:
+            content = sandbox.read_file(path)
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR: cannot read {path}: {exc}"
+        if "[truncated]" in content:
+            return f"ERROR: {path} is too large to edit with edit_file (content truncated); use write_file with complete content"
         if self.ledger is not None:
             if not self.ledger.has_seen(path):
                 return (
@@ -91,10 +117,18 @@ class EditFileTool(Tool):
                     f"ERROR: {path} changed on disk since your last read - "
                     "read it again, then retry the edit"
                 )
+        else:
+            # Ledger missing is a wiring bug — fail closed rather than blind edit
+            return "ERROR: edit ledger not configured"
         if old_string not in content:
             return f"ERROR: old_string not found in {path}"
         new_content = content.replace(old_string, new_string, 1)
-        sandbox.write_file(path, new_content)
+        if len(new_content) > _MAX_WRITE_CHARS:
+            return f"ERROR: result too large ({len(new_content)} > {_MAX_WRITE_CHARS})"
+        try:
+            sandbox.write_file(path, new_content)
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR: cannot write {path}: {exc}"
         if self.ledger is not None:
             self.ledger.remember(path, new_content)
         return f"OK: edited {path}"
@@ -120,15 +154,19 @@ class ListDirTool(Tool):
             if _SHELL_META_RE.search(path) or '"' in path or "'" in path:
                 return "ERROR: path contains unsupported characters for shell listing"
             quoted = shlex.quote(path)
+            last_error = "listing failed"
             for cmd in (
                 f"ls -la {quoted}",
                 f"ls -1 {quoted}",
                 f"python -c \"import os,sys; p=sys.argv[1]; print(chr(10).join(sorted(os.listdir(p))))\" {quoted}",
             ):
                 result = sandbox.exec(cmd)
-                if result.exit_code == 0 and result.stdout.strip():
-                    return result.stdout
-            return result.stdout if result.exit_code == 0 else f"ERROR: {result.stderr or 'listing failed'}"
+                if result.exit_code == 0:
+                    if result.stdout.strip():
+                        return result.stdout
+                    return "(empty directory)"
+                last_error = result.stderr or "listing failed"
+            return f"ERROR: {last_error}"
 
         # Direct file view: resolve and ensure confinement
         base = root if path in (".", "") else os.path.join(root, path)

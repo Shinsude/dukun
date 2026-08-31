@@ -27,7 +27,17 @@ class RunCommandTool(Tool):
     }
 
     def execute(self, sandbox: Sandbox, command: str, timeout: float = 120.0) -> str:
-        result = sandbox.exec(command, timeout=float(timeout))
+        try:
+            timeout_f = float(timeout)
+        except (TypeError, ValueError):
+            return f"ERROR: timeout must be a number, got {timeout!r}"
+        if not 0 < timeout_f <= 600:
+            return "ERROR: timeout must be between 0 and 600 seconds"
+        if not isinstance(command, str) or not command.strip():
+            return "ERROR: command must be a non-empty string"
+        if len(command) > 10000:
+            return "ERROR: command too long"
+        result = sandbox.exec(command, timeout=timeout_f)
         parts = [f"exit_code: {result.exit_code}"]
         if result.timed_out:
             parts.append("(command timed out)")
@@ -45,6 +55,8 @@ class GitDiffTool(Tool):
 
     def execute(self, sandbox: Sandbox) -> str:
         result = sandbox.exec("git diff", timeout=30)
+        if result.exit_code != 0:
+            return f"ERROR: git diff failed: {result.stderr[:500] or 'unknown'}"
         return result.stdout or "(no changes)"
 
 

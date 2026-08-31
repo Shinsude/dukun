@@ -30,8 +30,8 @@ _CREDENTIALS_VERSION = 1
 def credentials_path() -> Path:
     """Where keys are kept. Honours MANTRA_CREDENTIALS for tests."""
     override = os.environ.get(_OVERRIDE_ENV)
-    if override:
-        return Path(override)
+    if override and override.strip():
+        return Path(override.strip())
     return Path.home() / ".mantra" / "credentials.json"
 
 
@@ -46,8 +46,16 @@ def _load() -> dict[str, Any]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        # A corrupt file must not lock the user out of every provider;
-        # treat it as empty rather than crashing at startup.
+        # Quarantine corrupt file before treating as empty (like settings)
+        try:
+            import shutil
+            import time
+
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            backup = path.with_suffix(path.suffix + f".corrupt-{stamp}")
+            shutil.copy2(path, backup)
+        except OSError:
+            pass
         return {}
     return data if isinstance(data, dict) else {}
 

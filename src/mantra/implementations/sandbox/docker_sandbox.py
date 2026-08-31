@@ -17,6 +17,8 @@ from mantra.core.exceptions import AbortError, SandboxError
 from mantra.interfaces.sandbox import ExecResult, Sandbox
 
 _EXEC_TIMEOUT = 600.0
+_MAX_READ_BYTES = 500_000
+_MAX_EXEC_BYTES = 1_000_000
 
 
 class DockerSandbox(Sandbox):
@@ -90,6 +92,12 @@ class DockerSandbox(Sandbox):
         if abort is not None and abort.is_set():
             raise AbortError("interrupted by operator")
         try:
+            timeout_f = float(timeout)
+        except (TypeError, ValueError):
+            return ExecResult(exit_code=-1, stdout="", stderr=f"invalid timeout {timeout!r}", timed_out=False)
+        if timeout_f <= 0 or timeout_f > 600:
+            return ExecResult(exit_code=-1, stdout="", stderr="timeout out of range", timed_out=False)
+        try:
             proc = subprocess.Popen(
                 ["docker", "exec", self._container_id, "sh", "-lc", command],
                 stdout=subprocess.PIPE,
@@ -98,8 +106,8 @@ class DockerSandbox(Sandbox):
                 errors="replace",
             )
             interval = 0.1
-            limit = min(timeout, _EXEC_TIMEOUT)
-            deadline = time.monotonic() + float(limit)
+            limit = min(timeout_f, _EXEC_TIMEOUT)
+            deadline = time.monotonic() + limit
             while True:
                 if abort is not None and abort.is_set():
                     try:
@@ -113,6 +121,10 @@ class DockerSandbox(Sandbox):
                     raise AbortError("interrupted by operator")
                 try:
                     stdout, stderr = proc.communicate(timeout=interval)
+                    if stdout and len(stdout) > _MAX_EXEC_BYTES:
+                        stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
+                    if stderr and len(stderr) > _MAX_EXEC_BYTES:
+                        stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
                     return ExecResult(
                         exit_code=proc.returncode,
                         stdout=stdout or "",
@@ -125,6 +137,10 @@ class DockerSandbox(Sandbox):
                             stdout, stderr = proc.communicate(timeout=2)
                         except Exception:
                             stdout, stderr = "", ""
+                        if stdout and len(stdout) > _MAX_EXEC_BYTES:
+                            stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
+                        if stderr and len(stderr) > _MAX_EXEC_BYTES:
+                            stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
                         return ExecResult(
                             exit_code=-1, stdout=stdout or "", stderr=stderr or "", timed_out=True
                         )
@@ -155,6 +171,8 @@ class DockerSandbox(Sandbox):
         result = self._exec_no_shell(["cat", path])
         if result.exit_code != 0:
             raise SandboxError(f"read_file failed for {path}: {result.stderr[:500]}")
+        if len(result.stdout) > _MAX_READ_BYTES:
+            return result.stdout[:_MAX_READ_BYTES] + "\n... [truncated]"
         return result.stdout
 
     def write_file(self, path: str, content: str) -> None:
@@ -162,6 +180,8 @@ class DockerSandbox(Sandbox):
             raise SandboxError("sandbox not set up")
         if not self._is_safe_path(path):
             raise SandboxError(f"path escapes sandbox workspace: {path}")
+        if len(content) > _MAX_READ_BYTES * 2:
+            raise SandboxError(f"content too large ({len(content)} bytes)")
         # Stage locally, then docker cp; avoids shell-quoting hazards entirely.
         # Ensure destination is absolute inside workdir to avoid relative ambiguity
         dest = path
@@ -172,6 +192,10 @@ class DockerSandbox(Sandbox):
         ) as handle:
             handle.write(content)
             temp_path = handle.name
+        try:
+            os.chmod(temp_path, 0o600)
+        except OSError:
+            pass
         try:
             completed = subprocess.run(
                 [
@@ -204,6 +228,12 @@ class DockerSandbox(Sandbox):
         if abort is not None and abort.is_set():
             raise AbortError("interrupted by operator")
         try:
+            timeout_f = float(timeout)
+        except (TypeError, ValueError):
+            return ExecResult(exit_code=-1, stdout="", stderr=f"invalid timeout {timeout!r}", timed_out=False)
+        if timeout_f <= 0 or timeout_f > 600:
+            return ExecResult(exit_code=-1, stdout="", stderr="timeout out of range", timed_out=False)
+        try:
             proc = subprocess.Popen(
                 ["docker", "exec", self._container_id, *args],
                 stdout=subprocess.PIPE,
@@ -212,8 +242,8 @@ class DockerSandbox(Sandbox):
                 errors="replace",
             )
             interval = 0.1
-            limit = min(timeout, _EXEC_TIMEOUT)
-            deadline = time.monotonic() + float(limit)
+            limit = min(timeout_f, _EXEC_TIMEOUT)
+            deadline = time.monotonic() + limit
             while True:
                 if abort is not None and abort.is_set():
                     try:
@@ -227,6 +257,10 @@ class DockerSandbox(Sandbox):
                     raise AbortError("interrupted by operator")
                 try:
                     stdout, stderr = proc.communicate(timeout=interval)
+                    if stdout and len(stdout) > _MAX_EXEC_BYTES:
+                        stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
+                    if stderr and len(stderr) > _MAX_EXEC_BYTES:
+                        stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
                     return ExecResult(
                         exit_code=proc.returncode,
                         stdout=stdout or "",
@@ -239,6 +273,10 @@ class DockerSandbox(Sandbox):
                             stdout, stderr = proc.communicate(timeout=2)
                         except Exception:
                             stdout, stderr = "", ""
+                        if stdout and len(stdout) > _MAX_EXEC_BYTES:
+                            stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
+                        if stderr and len(stderr) > _MAX_EXEC_BYTES:
+                            stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
                         return ExecResult(
                             exit_code=-1, stdout=stdout or "", stderr=stderr or "", timed_out=True
                         )

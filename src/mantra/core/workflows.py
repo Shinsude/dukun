@@ -43,8 +43,8 @@ _MAX_STEP_CHARS = 4000
 def workflows_path() -> Path:
     """Where workflows live. Honours MANTRA_WORKFLOWS for tests."""
     override = os.environ.get(_OVERRIDE_ENV)
-    if override:
-        return Path(override)
+    if override and override.strip():
+        return Path(override.strip())
     return Path.home() / ".mantra" / "workflows.json"
 
 
@@ -62,6 +62,19 @@ def _empty() -> dict[str, Any]:
     return {"version": _VERSION, "workflows": {}}
 
 
+def _quarantine(target: Path) -> None:
+    """Copy corrupt file aside before overwriting."""
+    try:
+        import shutil
+        import time
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = target.with_suffix(target.suffix + f".corrupt-{stamp}")
+        shutil.copy2(target, backup)
+    except OSError:
+        pass
+
+
 def load_all() -> dict[str, Any]:
     """The whole file. A missing or corrupt file reads as empty.
 
@@ -76,6 +89,7 @@ def load_all() -> dict[str, Any]:
         with open(target, "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, json.JSONDecodeError):
+        _quarantine(target)
         return _empty()
     if not isinstance(data, dict) or not isinstance(data.get("workflows"), dict):
         return _empty()

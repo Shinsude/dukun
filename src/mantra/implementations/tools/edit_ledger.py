@@ -45,8 +45,20 @@ class EditLedger:
         ``.hidden/x`` with ``hidden/x``, so a read of one satisfied the
         edit guard for the other - the exact failure the guard exists to
         prevent.
+
+        Uses posix normpath to collapse ``a/./b``, ``a//b`` etc while
+        preserving ``.env`` distinction. Trailing slash stripped.
         """
+        import posixpath
+
         normalized = path.replace("\\", "/")
-        while normalized.startswith("./"):
+        # posixpath.normpath collapses redundant separators and ./ but
+        # also strips trailing slash — re-add for directory markers handled above
+        normalized = posixpath.normpath(normalized)
+        # normpath turns "" into ".", restore empty
+        if normalized == ".":
+            normalized = ""
+        # Remove leading ./ that normpath may leave as "./a"
+        if normalized.startswith("./"):
             normalized = normalized[2:]
         return normalized

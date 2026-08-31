@@ -9,8 +9,11 @@ stdlib version cannot drift out of date or fail to install.
 
 from __future__ import annotations
 
+import concurrent.futures
 import ipaddress
 import re
+import socket
+import urllib.parse
 import zlib
 from html.parser import HTMLParser
 from typing import Any
@@ -310,17 +313,18 @@ def _is_private_hostname(hostname: str | None) -> bool:
     # Additional DNS resolution check for hostnames that may resolve to private
     # This mitigates DNS rebinding where a name resolves to an internal address.
     # Best effort with short timeout, failures are treated as not private.
+    # Uses thread pool to avoid mutating global socket timeout.
     try:
-        import socket
-
-        # Use getaddrinfo with timeout via setting default timeout temporarily
-        # Only attempt for names that look like hostnames, not for URLs with path
         if re.match(r"^[a-z0-9.-]+$", host):
-            # Avoid blocking on external DNS for too long; use 2 second timeout
-            old_timeout = socket.getdefaulttimeout()
-            try:
-                socket.setdefaulttimeout(2)
-                infos = socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+            def _resolve():
+                return socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_resolve)
+                try:
+                    infos = fut.result(timeout=2)
+                except concurrent.futures.TimeoutError:
+                    return False
                 for family, _, _, _, sockaddr in infos:
                     addr = sockaddr[0]
                     try:
@@ -329,8 +333,6 @@ def _is_private_hostname(hostname: str | None) -> bool:
                             return True
                     except ValueError:
                         continue
-            finally:
-                socket.setdefaulttimeout(old_timeout)
     except Exception:
         pass
     return False
@@ -341,10 +343,27 @@ def _check_url_allowed(url: str) -> str | None:
         parsed = urlparse(url)
     except ValueError:
         return f"fetch failed: malformed URL {url!r}"
-    if parsed.scheme and parsed.scheme.lower() not in ("http", "https"):
-        return f"fetch failed: unsupported scheme '{parsed.scheme}'"
-    if _is_private_hostname(parsed.hostname):
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return f"fetch failed: unsupported scheme '{parsed.scheme or 'none'}' - only http and https can be fetched"
+    # Decode percent-encoded hostname for SSRF checks (e.g. %31%32%37)
+    hostname = parsed.hostname
+    if hostname:
+        try:
+            hostname = urllib.parse.unquote(hostname)
+        except Exception:
+            pass
+    if _is_private_hostname(hostname):
         return f"fetch failed: blocked private or internal host {parsed.hostname!r}"
+    # Also check netloc for encoded IP without hostname parsing
+    if not hostname and parsed.netloc:
+        # urlparse may fail to extract hostname for malformed URLs like http://0x7f.1
+        try:
+            netloc = urllib.parse.unquote(parsed.netloc.split("@")[-1].split(":")[0])
+            if _is_private_hostname(netloc):
+                return f"fetch failed: blocked private or internal host {netloc!r}"
+        except Exception:
+            pass
     return None
 
 
@@ -360,7 +379,7 @@ def _make_opener() -> object:
     Separated for testability: tests can mock this function to return
     a custom opener that simulates responses without network access.
     """
-    return build_opener(_SafeRedirectHandler)
+    return build_opener(_SafeRedirectHandler())
 
 
 class _SafeRedirectHandler(HTTPRedirectHandler):

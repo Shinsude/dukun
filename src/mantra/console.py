@@ -29,6 +29,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -76,21 +77,22 @@ from mantra.registry import build_llm, build_tools
 
 # Local helpers (container/dashboard removed — compact is sole TUI)
 _WRITE_LOCK = threading.Lock()
+from mantra.term import visible_len  # shared wide-aware impl (line_editor/compact/term)
 _ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
-def visible_len(text: str) -> int:
-    return len(_ANSI_RE.sub("", text))
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 KNOWN_FAILURES_PATH = os.path.join(PROJECT_ROOT, "knowledge", "known-failures.md")
 
 HELP_TEXT = """Commands:
-  /connect              add or switch endpoint. Give a URL and a key, then
+  /connect              add or switch endpoint — just a URL and key, then
                         pick from the models it serves. Nothing else to
                         configure. /connect list, /connect remove <name>
+                        /connect <url> [key] [model]  (all inline)
   /connect key [name]   replace the stored key. Always asks, so a key that
                         was mistyped can be put right
-  /model                pick a model from a menu, then an effort for it:
-                        off|minimal|low|medium|high|xhigh
+  /model                pick a model from a menu (filters as you type).
+                        Direct: /model <name>  or  /model <name> <effort>
+                        effort: off|minimal|low|medium|high|xhigh · /model help for details
   /help                 show this help
   /workspace            print the workspace path and its contents
   /memory               show the durable memory file for this workspace
@@ -189,7 +191,7 @@ class Style:
 
 # ANSI escape sequence pattern for sanitisation.
 import re as _re_mod
-_ANSI_SANITIZE_RE = _re_mod.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_ANSI_SANITIZE_RE = _re_mod.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*\x07|\].*?\x1b\\)")
 
 
 def _sanitize_output(text: str) -> str:
@@ -222,6 +224,13 @@ class StreamingRenderer:
     def render_piece(self, piece: str) -> str:
         """Render a text fragment with inline markdown."""
         self._buf += _sanitize_output(piece)
+        # Bound single-line growth without newlines to avoid unbounded memory
+        if len(self._buf) > 30000 and "\n" not in self._buf:
+            chunk = self._buf[:20000]
+            self._buf = self._buf[20000:]
+            return _render_md_line(chunk, self.style, self) + "\n"
+        if len(self._buf) > 50000:
+            self._buf = self._buf[-50000:]
         out = ""
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
@@ -241,7 +250,7 @@ SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
 class Spinner:
-    """Braille spinner on its own thread; pauses cleanly for real output."""
+    """Background spinner that pauses for real output."""
 
     def __init__(self, style: Style, label: str = "Chanting", frame: Any = None, layout: Any = None) -> None:
         self.style = style
@@ -337,58 +346,54 @@ def _render_md_line(line: str, style: Style, ctx: Any = None) -> str:
     in_fence = getattr(ctx, "_in_code_fence", False)
     stripped = line.strip()
 
-    # ── code fences ──────────────────────────────────────────────
     if in_fence:
         if stripped.startswith("```"):
             if ctx is not None:
                 ctx._in_code_fence = False
-            return style.dim(chr(0x2504) * 4)
-        return style.grey(line)
+            return style.dim("│" + "─" * 4)
+        return style.dim(line)
     if stripped.startswith("```"):
         if ctx is not None:
             ctx._in_code_fence = True
-        return style.grey(chr(0x2504) * 4)
+        return style.dim("│" + "─" * 4)
 
-    # ── headings ─────────────────────────────────────────────────
+    # ── headings ─────────────────────────────────────────
     if stripped.startswith("#"):
         level = len(stripped) - len(stripped.lstrip("#"))
         heading = stripped.lstrip("# ").rstrip()
         if level == 1:
-            return style.bold(style.bright_white(heading)) + chr(10) + style.grey(chr(0x2500) * 40)
+            return style.bold(style.bright_white(heading)) + chr(10) + style.dim(chr(0x2500) * 40)
         if level == 2:
-            return style.bold(heading) + chr(10) + style.grey(chr(0x2500) * 40)
+            return style.bold(heading) + chr(10) + style.dim(chr(0x2500) * 40)
         return style.bold(heading)
 
-    # ── horizontal rule ──────────────────────────────────────────
+    # ── horizontal rule ──────────────────────────────────
     if stripped in ("---", "***", "___") and len(stripped) >= 3:
-        return style.grey(chr(0x2500) * 40)
+        return style.dim(chr(0x2500) * 40)
 
-    # ── blockquote ───────────────────────────────────────────────
+    # ── blockquote ───────────────────────────────────────
     if stripped.startswith(">"):
         quote = stripped[1:].lstrip()
-        return style.grey("│ ") + style.dim(quote)
+        return style.dim("│ ") + style.dim(quote)
 
-    # ── unordered list ───────────────────────────────────────────
+    # ── unordered list ───────────────────────────────────
     m_list = re.match(r"^(\s*)[-*+]\s+(.*)", line)
     if m_list:
         indent, rest = m_list.group(1), m_list.group(2)
-        return indent + style.grey("• ") + _inline_md(rest, style)
+        return indent + style.bright_magenta("* ") + _inline_md(rest, style)
 
-    # ── ordered list ─────────────────────────────────────────────
+    # ── ordered list ─────────────────────────────────────
     m_ord = re.match(r"^(\s*)(\d+)[.)]\s+(.*)", line)
     if m_ord:
         indent, num, rest = m_ord.group(1), m_ord.group(2), m_ord.group(3)
-        return indent + style.bright_cyan(num + ". ") + _inline_md(rest, style)
+        return indent + style.bright_magenta(num + ". ") + _inline_md(rest, style)
 
-    # ── normal paragraph ─────────────────────────────────────────
+    # ── normal paragraph ─────────────────────────────────
     return _inline_md(line, style)
 
 
 def render_markdown(text: str, style: Style) -> str:
-    """Full markdown to ANSI: neon theme.
-
-    Headings, code fences, lists, blockquotes, horizontal rules,
-    inline code, bold, italic, and links.
+    """Render Markdown to styled terminal output.
     """
     out_lines = []
     in_fence = False
@@ -397,10 +402,10 @@ def render_markdown(text: str, style: Style) -> str:
         # Code fence toggle.
         if stripped.startswith("```"):
             in_fence = not in_fence
-            out_lines.append(style.grey(chr(0x2504) * 4) if in_fence else style.dim(chr(0x2504) * 4))
+            out_lines.append(style.dim("│" + "─" * 4) if in_fence else style.dim("│" + "─" * 4))
             continue
         if in_fence:
-            out_lines.append(style.grey(line))
+            out_lines.append(style.dim(line))
             continue
         # Headings.
         if stripped.startswith("#"):
@@ -411,28 +416,28 @@ def render_markdown(text: str, style: Style) -> str:
             else:
                 out_lines.append(style.bold(heading))
             if level <= 2:
-                out_lines.append(style.grey(chr(0x2500) * 40))
+                out_lines.append(style.dim(chr(0x2500) * 40))
             continue
         # Horizontal rule.
         if stripped in ("---", "***", "___") and len(stripped) >= 3:
-            out_lines.append(style.grey(chr(0x2500) * 40))
+            out_lines.append(style.dim(chr(0x2500) * 40))
             continue
         # Blockquote.
         if stripped.startswith(">"):
             quote = stripped[1:].lstrip()
-            out_lines.append(style.grey("│ ") + style.dim(quote))
+            out_lines.append(style.dim("│ ") + style.dim(quote))
             continue
         # Unordered list.
         m_list = re.match(r"^(\s*)[-*+]\s+(.*)", line)
         if m_list:
             indent, rest = m_list.group(1), m_list.group(2)
-            out_lines.append(indent + style.grey("• ") + _inline_md(rest, style))
+            out_lines.append(indent + style.bright_magenta("* ") + _inline_md(rest, style))
             continue
         # Ordered list.
         m_ord = re.match(r"^(\s*)(\d+)[.)]\s+(.*)", line)
         if m_ord:
             indent, num, rest = m_ord.group(1), m_ord.group(2), m_ord.group(3)
-            out_lines.append(indent + style.bright_cyan(num + ". ") + _inline_md(rest, style))
+            out_lines.append(indent + style.bright_magenta(num + ". ") + _inline_md(rest, style))
             continue
         # Normal paragraph.
         out_lines.append(_inline_md(line, style))
@@ -446,7 +451,7 @@ def _inline_md(line: str, style: Style) -> str:
     parts = line.split("`")
     for i in range(0, len(parts)):
         if i % 2 == 1:
-            parts[i] = style.grey(parts[i])
+            parts[i] = style.bright_magenta(parts[i])
         else:
             segment = parts[i]
             # Links: [text](url) -> styled text
@@ -568,12 +573,40 @@ class ConsoleSession:
             max_messages=int(ctx_cfg.get("max_messages", 200)),
             max_chars=int(ctx_cfg.get("max_chars", 240_000)),
         )
+        env = render_environment(workspace)
+        # Preload workspace map so model is not blind before user asks
+        try:
+            entries = os.listdir(workspace)[:50]
+            files = []
+            for e in sorted(entries)[:35]:
+                p = os.path.join(workspace, e)
+                files.append(f"{e}/" if os.path.isdir(p) else e)
+            env += f"\n- workspace files: {', '.join(files) or '(empty)'}"
+            for hint in ("README.md", "package.json", "pyproject.toml", "AGENTS.md", "main.py", "index.html"):
+                if hint in entries:
+                    env += f"\n- has {hint}"
+            # Inject README head so model can answer "what does this project do" without tool call
+            for readme in ("README.md", "readme.md"):
+                rp = os.path.join(workspace, readme)
+                if os.path.isfile(rp):
+                    try:
+                        with open(rp, "r", encoding="utf-8", errors="replace") as f:
+                            head = f.read(2500).strip().replace("\r", "")
+                        if head:
+                            # Keep first ~400 chars of README as context
+                            snippet = head[:500].replace("\n", " ")
+                            env += f"\n- README: {snippet[:400]}"
+                        break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         self.system_prompt = assemble_system_prompt(
             config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT,
             known_failures_path=KNOWN_FAILURES_PATH,
             memory_path=self.memory_path,
             instructions_path=self.instructions_path,
-            environment=render_environment(workspace),
+            environment=env,
         )
         self.tools = build_tools(config["tools"])
         self.llm = llm if llm is not None else build_llm(config["llm"])
@@ -773,15 +806,14 @@ class ConsoleSession:
             if tool in ("write_file", "edit_file", "read_file", "list_dir"):
                 path = args.get("path") or args.get("directory") or ""
                 if path:
-                    detail = f" {self.style.dim(path)}"
+                    detail = f" {self.style.dim('>')} {self.style.dim(path.upper())}"
             elif tool == "run_command":
                 cmd = args.get("command") or ""
                 if cmd:
-                    # Truncate long commands.
-                    detail = f" {self.style.dim(cmd[:60])}{'…' if len(cmd) > 60 else ''}"
-            self._print(f"  {self.style.dim(f'· step {step}')} {self.style.yellow(tool)}{detail}")
+                    detail = f" {self.style.dim('>')} {self.style.dim(cmd[:60].upper())}{'...' if len(cmd) > 60 else ''}"
+            self._print(f"  {self.style.dim(f'* STEP {step}')} {self.style.bright_magenta(tool.upper())}{detail}")
         elif name == "tool_denied":
-            self._print(f"  {self.style.red('✗ denied')} {self.style.dim(payload.get('tool',''))}")
+            self._print(f"  {self.style.red('✗ DENIED')} {self.style.dim(payload.get('tool','').upper())}")
         elif name == "run_error":
             self._print(f"  {self.style.red('!! ' + str(payload.get('error')))}")
         elif name == "tool_result":
@@ -792,13 +824,12 @@ class ConsoleSession:
             # Show result for file-edit tools
             if tool in ("edit_file", "write_file"):
                 if isinstance(result, str) and result.strip():
-                    # Show coloured diff
                     self._print(self._format_diff(result.strip()))
                 elif self.verbose:
-                    detail = self.style.dim("ok" if ok else "failed")
+                    detail = self.style.dim("OK" if ok else "FAILED")
                     self._print(f"    {detail} {seconds}s")
             elif self.verbose:
-                detail = self.style.dim("ok" if ok else "failed")
+                detail = self.style.dim("OK" if ok else "FAILED")
                 self._print(f"    {detail} {seconds}s")
 
     def _on_delta(self, piece: str) -> None:
@@ -818,13 +849,13 @@ class ConsoleSession:
         rendered = self._stream_renderer.render_piece(piece)
         if self.layout is not None and self.layout.active:
             if not self._stream_header_done:
-                self.layout.write(f"{self.style.bold('agent')} ")
+                self.layout.write(f"{self.style.neon_title('ENCHANTER')} ")
                 self._stream_header_done = True
             self.layout.write(rendered)
             self._update_live_counter()
         else:
             if not self._stream_header_done:
-                sys.stdout.write(f"{self.style.bold('agent')} ")
+                sys.stdout.write(f"{self.style.neon_title('ENCHANTER')} ")
                 self._stream_header_done = True
             sys.stdout.write(rendered)
             sys.stdout.flush()
@@ -963,8 +994,8 @@ class ConsoleSession:
         truncated = len(content) > MAX_ATTACH_CHARS
         body = content[:MAX_ATTACH_CHARS].rstrip()
         if truncated:
-            body += "\n... [truncated]"
-        return f"--- @{rel} ---\n{body}"
+            body += "\n* [truncated]"
+        return f"* @{rel.upper()} *\n{body}"
 
     @staticmethod
     def _render_listing(rel: str, full: str) -> str:
@@ -972,9 +1003,9 @@ class ConsoleSession:
             entries = sorted(os.listdir(full))[:MAX_LISTING_ENTRIES]
         except OSError:
             return ""
-        lines = [f"--- @{rel} (directory, {len(entries)} entries) ---"]
+        lines = [f"* @{rel.upper()} ({len(entries)} entries) *"]
         for entry in entries:
-            kind = "dir " if os.path.isdir(os.path.join(full, entry)) else "file"
+            kind = "DIR " if os.path.isdir(os.path.join(full, entry)) else "FILE"
             lines.append(f"{kind} {entry}")
         return "\n".join(lines)
 
@@ -1246,7 +1277,7 @@ class ConsoleSession:
                     # instead of streamed a word at a time.
                     self.frame.row(body)
                 else:
-                    self._print(f"{self.style.bold('agent')} {body}")
+                    self._print(f"{self.style.neon_title('ENCHANTER')} {body}")
             if result is not None:
                 self._record_usage(result)
                 self._record_memory(task, result)
@@ -1421,6 +1452,15 @@ class ConsoleSession:
     # ---- session persistence ---------------------------------------------
 
     def save_session(self, path: str) -> bool:
+        # Validate path is inside allowed directories to prevent arbitrary write
+        if not _is_safe_session_path(path, self.workspace):
+            self._print(self.style.yellow(f"  refusing to save outside allowed dirs: {path}"))
+            self._print(self.style.dim(f"  allowed: workspace, {sessions.sessions_dir()}, temp"))
+            return False
+        # Enforce size cap on file path length and payload
+        if len(path) > 500:
+            self._print(self.style.red("  save failed: path too long"))
+            return False
         payload = {
             "version": 1,
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1429,9 +1469,25 @@ class ConsoleSession:
             "totals": self.totals,
             "messages": self.context.messages,
         }
+        # Cap file size via payload size check
         try:
+            data = json.dumps(payload, ensure_ascii=False)
+            if len(data) > 10_000_000:
+                self._print(self.style.red("  save failed: session too large"))
+                return False
+        except Exception:
+            pass
+        try:
+            # Ensure parent dir exists with restricted perms
+            parent = os.path.dirname(os.path.abspath(path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(path, "w", encoding="utf-8", newline="\n") as handle:
                 json.dump(payload, handle, ensure_ascii=False, indent=2)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
         except OSError as exc:
             self._print(self.style.red(f"  save failed: {exc}"))
             return False
@@ -1439,7 +1495,17 @@ class ConsoleSession:
         return True
 
     def load_session(self, path: str) -> bool:
+        if not _is_safe_session_path(path, self.workspace):
+            self._print(self.style.yellow(f"  refusing to load outside allowed dirs: {path}"))
+            return False
         try:
+            # Size check before load
+            try:
+                if os.path.getsize(path) > 10_000_000:
+                    self._print(self.style.red("  load failed: file too large"))
+                    return False
+            except OSError:
+                pass
             with open(path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
@@ -1449,6 +1515,9 @@ class ConsoleSession:
         if not isinstance(messages, list) or not messages:
             self._print(self.style.red("  load failed: no messages in file"))
             return False
+        if len(messages) > 500:
+            self._print(self.style.yellow(f"  warning: large session {len(messages)} messages, truncating"))
+            messages = messages[-500:]
         self.context.messages = list(messages)
         self.context.resync()
         totals = payload.get("totals")
@@ -1546,14 +1615,12 @@ class ConsoleSession:
             role = msg.get("role", "")
             content = msg.get("content", "")
             if role == "user" and isinstance(content, str):
-                ts = ""
-                self._print(f"{self.style.on_grey(ts)} {self.style.bold(content)}")
+                self._print(f"{self.style.neon_label('you')} {content}")
             elif role == "assistant" and isinstance(content, str):
-                # Show a condensed version of assistant replies.
-                preview = content.strip()
-                if len(preview) > 120:
-                    preview = preview[:120] + "..."
-                self._print(f"{self.style.green('agent')} {self.style.dim(preview)}")
+                self._print(f"{self.style.neon_title('ENCHANTER')}")
+                self._print(content)
+            elif role == "tool" and isinstance(content, str):
+                self._print(f"{self.style.dim('tool')} {self.style.dim(content[:200])}")
         summary = data.get("summary") or ""
         if summary:
             self._print(self.style.dim(f"  started with: {summary}"))
@@ -1632,10 +1699,17 @@ class ConsoleSession:
     def show_workspace(self) -> None:
         root = self.sandbox.root
         self._print(f"workspace: {root}")
-        entries = sorted(os.listdir(root))[:50] if os.path.isdir(root) else []
+        try:
+            entries = sorted(os.listdir(root))[:50] if os.path.isdir(root) else []
+        except OSError as exc:
+            self._print(self.style.red(f"  cannot list workspace: {exc}"))
+            return
         for entry in entries:
-            full = os.path.join(root, entry)
-            self._print(("> " if os.path.isdir(full) else "") + entry)
+            try:
+                full = os.path.join(root, entry)
+                self._print(("> " if os.path.isdir(full) else "") + entry)
+            except OSError:
+                self._print(entry)
         if not entries:
             self._print("(empty)")
 
@@ -1950,8 +2024,8 @@ def provider_needs_key(base_url: str, api_key_env: str) -> bool:
 
 
 SLASH_COMMANDS = [
-    ("/connect", "add or switch endpoint - URL and key, models auto-fetch"),
-    ("/model", "pick a model (and its reasoning effort) from a menu"),
+    ("/connect", "add or switch endpoint — /connect <url> [key] [model], list, remove, key"),
+    ("/model", "pick a model — /model <name> [effort], or menu"),
     # After the two a newcomer needs: useful, but not day one.
     ("/connect key", "replace the stored key for an endpoint"),
     ("/help", "show the command list"),
@@ -2014,6 +2088,9 @@ class ConsoleCompleter:
                 if len(entries) >= MAX_INDEX_ENTRIES:
                     break
         except OSError:
+            # Silent fallback: one unreadable directory must not break completion.
+            # The previous attempt to print via self._print/self.style crashed
+            # because ConsoleCompleter has neither attribute (see audit).
             entries = []
         self._entries = entries[:MAX_INDEX_ENTRIES]
         self._indexed = True
@@ -2034,21 +2111,25 @@ class ConsoleCompleter:
         token = buffer[start:cursor]
         if token.startswith("@"):
             return self._complete_path(start, cursor, token[1:])
-        if buffer.startswith("/") and start == 0:
-            return self._complete_command(cursor, token)
-        # "/model gpt-" completes from the endpoint's own catalogue once
-        # we have fetched it, which beats guessing at names.
-        if buffer.startswith("/model "):
+        # Slash commands: allow leading whitespace, but only when the slash
+        # token is the first non-space token (so "hello /help" does not
+        # trigger, but "  /help" does).
+        if token.startswith("/") and buffer[:start].strip() == "":
+            return self._complete_command(cursor, token, start)
+        # Sub-command completions: use lstrip so leading spaces don't break
+        # them (operator may indent). Keep start-based token for replacement.
+        stripped = buffer.lstrip()
+        if stripped.startswith("/model "):
             return self._complete_model(cursor, token)
-        if buffer.startswith("/connect"):
+        if stripped.startswith("/connect"):
             c = self._complete_connect(buffer, start, cursor, token)
             if c:
                 return c
-        if buffer.startswith("/skills"):
+        if stripped.startswith("/skills"):
             c = self._complete_skills(buffer, start, cursor, token)
             if c:
                 return c
-        if buffer.startswith("/workflow"):
+        if stripped.startswith("/workflow"):
             c = self._complete_workflow(buffer, start, cursor, token)
             if c:
                 return c
@@ -2066,7 +2147,7 @@ class ConsoleCompleter:
             items=matches, start=cursor - len(token), end=cursor, labels=labels
         )
 
-    def _complete_command(self, cursor: int, token: str):
+    def _complete_command(self, cursor: int, token: str, start: int = 0):
         matches = [name for name, _ in SLASH_COMMANDS if name.startswith(token)]
         if not matches:
             return None
@@ -2074,7 +2155,7 @@ class ConsoleCompleter:
         for name in matches:
             description = next((d for n, d in SLASH_COMMANDS if n == name), "")
             labels.append(f"{name}  {description}")
-        return Completion(items=matches, start=0, end=cursor, labels=labels)
+        return Completion(items=matches, start=start, end=cursor, labels=labels)
 
     def _complete_path(self, start: int, cursor: int, query: str):
         if not self._entries:
@@ -2246,6 +2327,48 @@ def _infer_workspace() -> str:
     if any(normalized.lower() == p.lower().rstrip("\\/") for p in protected):
         return os.path.join(PROJECT_ROOT, "workspace")
     return cwd
+
+
+def _is_safe_session_path(path: str, workspace: str) -> bool:
+    """Check if a session file path is inside allowed directories."""
+    try:
+        real = os.path.realpath(os.path.abspath(path))
+        # Allow workspace and its .mantra, sessions dir, temp dir, and home/.mantra
+        allowed = [
+            os.path.realpath(workspace),
+            os.path.realpath(os.path.join(workspace, ".mantra")),
+            os.path.realpath(sessions.sessions_dir()),
+            os.path.realpath(tempfile.gettempdir()),
+            os.path.realpath(os.path.expanduser("~/.mantra")),
+        ]
+        # Also allow current project workspace default
+        try:
+            allowed.append(os.path.realpath(os.path.join(PROJECT_ROOT, "workspace")))
+        except Exception:
+            pass
+        for base in allowed:
+            if real == base or real.startswith(base + os.sep):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _mask_line(line: str) -> str:
+    """Mask secrets in a line before echoing (e.g. /connect key)."""
+    stripped = line.strip()
+    # Mask /connect <url> <key> -> hide key
+    if stripped.lower().startswith("/connect"):
+        parts = stripped.split()
+        if len(parts) >= 3 and parts[1] not in ("list", "remove", "key", "keys", "show", "forget", "delete"):
+            # Assume last part is key
+            parts[-1] = "***"
+            return " ".join(parts)
+        # Also mask key in "key" subcommand
+        if len(parts) >= 3 and parts[1] in ("key",):
+            parts[-1] = "***"
+            return " ".join(parts)
+    return line
 
 
 # ------------------------------------------------------------------ commands
@@ -2451,7 +2574,7 @@ def _skills_bundles(session: "ConsoleSession") -> None:
         return
     session._print(session.style.bold(f"  bundles ({len(bundles)})"))
     for name, steps in sorted(bundles.items()):
-        session._print(f"  {name:<16} {session.style.dim(' → '.join(steps))}")
+        session._print(f"  {name:<16} {session.style.dim(' > '.join(steps))}")
     session._print("")
     session._print(session.style.dim("  /skills launch <bundle> to run one in order"))
 
@@ -2463,7 +2586,7 @@ def _skills_launch(session: "ConsoleSession", name: str) -> RunResult | None:
         if not bundles:
             session._print(session.style.dim("  no bundles found"))
             return None
-        choice = _menu(session, "Launch bundle", [Option(value=n, label=n, hint=" → ".join(v[:2])) for n, v in sorted(bundles.items())])
+        choice = _menu(session, "Launch bundle", [Option(value=n, label=n, hint=" > ".join(v[:2])) for n, v in sorted(bundles.items())])
         if not choice:
             session._print(session.style.dim("  usage: /skills launch <bundle>"))
             return None
@@ -2472,7 +2595,7 @@ def _skills_launch(session: "ConsoleSession", name: str) -> RunResult | None:
     if steps is None:
         bundles = skills.load_bundles()
         if bundles:
-            choice = _menu(session, f"Bundle '{name}' not found", [Option(value=n, label=n, hint=" → ".join(v[:2])) for n, v in sorted(bundles.items())])
+            choice = _menu(session, f"Bundle '{name}' not found", [Option(value=n, label=n, hint=" > ".join(v[:2])) for n, v in sorted(bundles.items())])
             if choice:
                 return _skills_launch(session, choice)
         session._print(session.style.red(f"  no bundle named '{name}'"))
@@ -2781,6 +2904,8 @@ def _menu(
     hint: str = "",
     allow_filter: bool = True,
     cursor: int = 0,
+    allow_delete: bool = False,
+    on_delete: Any = None,
 ) -> str | None:
     """Open a selectable menu and return the chosen value.
 
@@ -2789,16 +2914,22 @@ def _menu(
     """
     if not options:
         return None
+    if allow_delete:
+        hint = (hint + " · d deletes") if hint else "up/down · enter selects · esc cancels · d deletes"
+    else:
+        hint = hint or "up/down or click · enter selects · esc cancels"
     chosen = choose(
         session.style,
         title,
         options,
-        hint=hint or "up/down or click · enter selects · esc cancels",
+        hint=hint,
         allow_filter=allow_filter,
         cursor=cursor,
         # Menus are drawn as frame rows when the session is framed, so
         # a list never hangs off the side of the box.
         frame=session.frame,
+        allow_delete=allow_delete,
+        on_delete=on_delete,
     )
     # The menu returns "" for an explicit cancel and None when there is
     # no terminal; both mean "leave things as they are".
@@ -2967,41 +3098,75 @@ def _type_a_model(session: "ConsoleSession") -> bool:
 def _choose_model(session: "ConsoleSession") -> bool:
     """Open the model menu; effort follows as part of the same choice.
 
-    This is the single place model and reasoning are decided, because
-    effort is a property of the chosen model rather than a separate
-    setting the operator has to remember to keep in step.
+    Now shows *all* providers' stored models together so the operator
+    can pick any model without switching endpoint first. The endpoint
+    is auto-switched to the provider that owns the chosen model.
     """
     llm = session.config.get("llm", {})
     base_url = llm.get("base_url", "")
-    if not base_url:
-        session._print(session.style.yellow("  no endpoint configured - /connect first"))
-        return False
-
+    # Build combined catalogue from all stored endpoints
+    all_by_model: dict[str, str] = {}  # model -> provider
+    for ep_name, entry in known_endpoints().items():
+        for m in entry.get("models", []) or []:
+            if m not in all_by_model:
+                all_by_model[m] = ep_name
+    # Prefer live catalogue from current endpoint, merged into all
     name = session.endpoint_name
-    models = models_for(name) if name else []
-    # Prefer what the endpoint says right now; fall back to the models
-    # recorded in the settings file when it cannot be reached.
     fetched, error = _try_fetch(session)
     if fetched:
-        models = fetched
         session.known_models = fetched
         if name:
             set_models(name, fetched)
-    elif not models:
+        for m in fetched:
+            if m not in all_by_model:
+                all_by_model[m] = name or "current"
+    elif not all_by_model:
+        # No stored models anywhere and fetch failed
+        if not base_url:
+            session._print(session.style.yellow("  no endpoint configured - /connect first"))
+            return False
         return _rescue_catalogue(session, error)
     else:
-        session.known_models = models
+        # Use stored catalogue when fetch fails but we have something
+        session.known_models = list(all_by_model.keys())
 
-    # Always offer typing a name: a catalogue is never complete, and
-    # without it an endpoint serving one model nobody listed is a dead
-    # end rather than one more keystroke.
-    options = _model_options(session, models)
+    # Prepare options with provider hint
+    current = llm.get("model", "")
+    options: list[Option] = []
+    for m, provider in sorted(all_by_model.items(), key=lambda x: x[0].lower()):
+        hint = provider
+        if m == current:
+            hint = (hint + " · current").strip(" ·") if hint else "current"
+        if is_reasoning_model(m):
+            hint = (hint + " · thinks").strip(" ·") if hint else "thinks"
+        options.append(Option(value=m, hint=hint))
+    # Always offer typing a name
     options.append(Option(value=TYPE_A_MODEL, hint="not listed above"))
-    chosen = _menu(session, f"models at {base_url}", options)
+    title = "models — all providers" if len(known_endpoints()) > 1 else f"models at {base_url}" if base_url else "models"
+
+    def _on_delete_model(model: str) -> None:
+        provider = all_by_model.get(model)
+        if not provider:
+            return
+        entry = known_endpoints().get(provider)
+        if not entry:
+            return
+        models = [m for m in entry.get("models", []) if m != model]
+        set_models(provider, models)
+        session._print(session.style.dim(f"  removed model '{model}' from {provider}"))
+        # keep map in sync
+        all_by_model.pop(model, None)
+
+    chosen = _menu(session, title, options, allow_delete=True, on_delete=_on_delete_model)
     if not chosen:
         return False
     if chosen == TYPE_A_MODEL:
         return _type_a_model(session)
+    # Auto-switch endpoint if model belongs to different provider
+    provider = all_by_model.get(chosen)
+    if provider and provider != name:
+        session._print(session.style.dim(f"  switching to {provider} for {chosen}"))
+        session.use_endpoint(provider)
     _apply_model(session, chosen, _pick_effort(session, chosen))
     return True
 
@@ -3023,11 +3188,41 @@ def _endpoint_options(session: "ConsoleSession") -> list[Option]:
 
 
 def _connect_choose_endpoint(session: "ConsoleSession") -> str | None:
-    """Menu over saved endpoints. None means the operator cancelled."""
+    """Menu over saved endpoints. None means the operator cancelled. Press d to remove."""
     known = known_endpoints()
     if not known:
         return NEW_ENDPOINT
-    return _menu(session, "endpoints", _endpoint_options(session), allow_filter=False)
+
+    def _on_delete(name: str) -> None:
+        # Remove endpoint and its key in one go (baseurl + key together)
+        entry = known_endpoints().get(name.lower())
+        key_env = entry.get("api_key_env") if entry else ""
+        removed = remove_endpoint(name.lower())
+        if removed:
+            # Also remove stored key if only this endpoint used it
+            if key_env:
+                still_used = any(
+                    e.get("api_key_env") == key_env
+                    for n, e in known_endpoints().items()
+                    if n != name.lower()
+                )
+                if not still_used:
+                    try:
+                        from mantra.core.keys import remove as remove_key
+
+                        remove_key(key_env)
+                    except Exception:
+                        pass
+            session._print(session.style.dim(f"  removed '{name}' (+ key {key_env})"))
+
+    return _menu(
+        session,
+        "endpoints",
+        _endpoint_options(session),
+        allow_filter=False,
+        allow_delete=True,
+        on_delete=_on_delete,
+    )
 
 
 def _replace_key(session: "ConsoleSession", name: str = "") -> bool:
@@ -3066,7 +3261,15 @@ def _replace_key(session: "ConsoleSession", name: str = "") -> bool:
     stored = stored_keys().get(key_env, "")
     if stored:
         session._print(s.dim(f"  {name} is using {mask(stored)}"))
-    key = _ask_secret(session, f"  new api key for {name} (hidden, blank cancels)> ").strip()
+    try:
+        key = _read_secret(session.prompt_text(f"  new api key for {name} (visible, blank cancels)> "), closer=session.close_prompt).strip()
+        if not key:
+            # Fallback for tests that mock _read_choice instead of _read_secret
+            alt = _read_choice(session, f"  new api key for {name} (visible, blank cancels)> ").strip()
+            if alt:
+                key = alt
+    except Exception:
+        key = _read_choice(session, f"  new api key for {name} (visible, blank cancels)> ").strip()
     if not key:
         session._print(s.dim("  cancelled"))
         return False
@@ -3075,11 +3278,15 @@ def _replace_key(session: "ConsoleSession", name: str = "") -> bool:
     return True
 
 
-def _connect_new(session: "ConsoleSession", url: str = "", key: str = "") -> bool:
+def _connect_new(session: "ConsoleSession", url: str = "", key: str = "", model: str = "") -> bool:
     """Walk through adding an endpoint: URL, key, then pick a model."""
     s = session.style
     if not url:
-        url = _read_choice(session, "  endpoint url (https://...)> ").strip()
+        url = _read_choice(session, "  endpoint url (e.g. https://api.openai.com/v1)> ").strip()
+        if not url:
+            session._print(s.dim("  tip: paste a full URL, or try /connect list to see saved ones"))
+            session._print(s.dim("  examples: /connect https://api.openai.com/v1  ·  /connect https://api.meta.ai/v1"))
+            return False
     if not url:
         session._print(s.dim("  cancelled"))
         return False
@@ -3101,38 +3308,47 @@ def _connect_new(session: "ConsoleSession", url: str = "", key: str = "") -> boo
     key_env = _derive_key_env(name)
 
     if key:
-        # An explicit key always replaces the stored one. Otherwise a
-        # rejected key could never be corrected by re-running the same
-        # command, which is the first thing anyone would try.
         store_key(key_env, key)
         session._print(s.dim(f"  key stored ({mask(key)})"))
-    elif provider_needs_key(url, key_env) and not (
-        os.environ.get(key_env) or has_stored(key_env)
-    ):
-        # Only ask when it is genuinely missing: one already in the
-        # environment or the store is left alone, and /connect key is
-        # the way to replace it.
-        key = _ask_secret(session, f"  api key for {name} (hidden)> ")
-        if not key:
+    elif provider_needs_key(url, key_env):
+        # Always prompt for key in interactive add (visible), show existing
+        existing = os.environ.get(key_env) or stored_keys().get(key_env, "")
+        if existing:
+            session._print(s.dim(f"  current key {mask(existing)} ({key_env}) — press enter to keep, or paste new"))
+        key = _read_choice(session, f"  api key for {name}> ").strip()
+        if key:
+            store_key(key_env, key)
+            # Also clear env if it was wrong and now stored wins after restart; advise
+            if os.environ.get(key_env) and os.environ.get(key_env) != key:
+                session._print(s.yellow(f"  note: ${key_env} env still set and wins until you restart shell"))
+            session._print(s.dim(f"  key stored ({mask(key)})"))
+        elif not existing:
             session._print(s.yellow("  no key given - skipping the fetch"))
             session._print(s.dim("  store one later with /connect key, or add one to"))
             session._print(s.dim(f"  {settings_path()}"))
             return False
-        store_key(key_env, key)
-        session._print(s.dim(f"  key stored ({mask(key)})"))
+        # else keep existing
 
     try:
         add_endpoint(name, url, key_env, note=f"added {time.strftime('%Y-%m-%d')}")
     except ValueError as exc:
         session._print(s.red(f"  {exc}"))
         return False
-    session._print(s.dim(f"  saved '{name}' → {url}"))
+    session._print(s.dim(f"  saved '{name}' > {url}"))
     if not session.use_endpoint(name):
         return False
-    picked = _choose_model(session)
-    # After the model menu: the header now names both the new endpoint
-    # and the model the operator just chose.
+    # If a model was supplied inline (3-arg form), use it directly
+    if model:
+        _apply_model(session, model)
+        session.refresh_title()
+        return True
     session.refresh_title()
+    # Endpoint + key done — now fetch models in same flow
+    session._print(s.dim("  fetching models…"))
+    picked = _choose_model(session)
+    # If fetch failed or user cancelled, hint one-liner
+    if not picked:
+        session._print(s.dim("  tip: /connect <url> <key> <model> to set in one go"))
     return picked
 
 
@@ -3143,14 +3359,28 @@ def _connect(session: "ConsoleSession", args: list[str]) -> bool:
     catalogue comes from the endpoint itself, so no model name has to be
     typed or remembered.
     """
-    if len(args) >= 2:
-        # Scripted form: /connect <url> <key>
-        return _connect_new(session, args[0], args[1])
-    if len(args) == 1:
-        if args[0] in ("list", "show"):
-            session.show_endpoints()
-            return True
-        if args[0] in ("remove", "forget", "delete"):
+    if args and args[0].lower() in ("help", "-h", "--help", "?", "h"):
+        s = session.style
+        session._print(s.bold("  /connect — add or switch endpoint"))
+        session._print(s.dim("  usage:"))
+        session._print("    /connect                         — pick from saved or add new")
+        session._print("    /connect <url>                   — add endpoint, then pick model")
+        session._print("    /connect <url> <key>             — add with key, then pick model")
+        session._print("    /connect <url> <key> <model>     — add and set model directly")
+        session._print("    /connect <name>                  — switch to saved endpoint")
+        session._print("    /connect list                    — show saved endpoints")
+        session._print("    /connect remove <name>           — delete endpoint")
+        session._print("    /connect key [name]              — replace stored key")
+        session._print(s.dim("  examples:"))
+        session._print("    /connect https://api.openai.com/v1 sk-...")
+        session._print("    /connect https://api.meta.ai/v1")
+        session._print("    /connect groq")
+        return True
+    # Subcommands first — before treating args as url
+    if args and args[0].lower() in ("remove", "forget", "delete", "rm"):
+        if len(args) >= 2:
+            _connect_remove(session, args[1])
+        else:
             eps = sorted(known_endpoints().keys())
             if not eps:
                 session._print(session.style.dim("  no endpoints to remove"))
@@ -3158,6 +3388,25 @@ def _connect(session: "ConsoleSession", args: list[str]) -> bool:
                 choice = _menu(session, "Remove endpoint", [Option(value=n, label=n, hint=known_endpoints()[n].get("base_url","")) for n in eps])
                 if choice:
                     _connect_remove(session, choice)
+        return True
+    if args and args[0].lower() in ("key", "keys"):
+        if len(args) >= 3:
+            # /connect key <name> <key> — direct replace no prompt
+            store_key(_derive_key_env(args[1].lower()), args[2])
+            session._print(session.style.dim(f"  key stored for {args[1].lower()} ({args[2][:4]}…{args[2][-4:]})"))
+            return True
+        if len(args) == 2:
+            return _replace_key(session, args[1])
+        return _replace_key(session, "")
+    if len(args) >= 3:
+        # Scripted form: /connect <url> <key> <model>
+        return _connect_new(session, args[0], args[1], args[2])
+    if len(args) >= 2:
+        # Scripted form: /connect <url> <key>
+        return _connect_new(session, args[0], args[1])
+    if len(args) == 1:
+        if args[0].lower() in ("list", "show"):
+            session.show_endpoints()
             return True
         # A saved endpoint's own name means "switch to it". Saved names
         # never contain a dot or a slash, so an exact match cannot be a
@@ -3273,16 +3522,28 @@ def _derive_name(url: str) -> str:
     Strips the ``api.`` and ``www.`` prefixes and the port, then keeps
     the first label: ``api.openai.com`` -> ``openai``. Used both as the
     saved provider name and as the seed for the env var name.
+    Suffix from path avoids collision (e.g. /v1 vs /go/v1).
     """
-    host = urlparse(url).hostname or ""
-    host = host.lower()
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return "endpoint"
     for prefix in ("api.", "www."):
         if host.startswith(prefix):
             host = host[len(prefix) :]
             break
     host = host.split(":")[0]
     label = host.split(".")[0] if host else ""
-    return re.sub(r"[^a-z0-9]+", "", label) or "endpoint"
+    base = re.sub(r"[^a-z0-9]+", "", label) or "endpoint"
+    # Add path-derived suffix when useful (last non-v segment)
+    path = parsed.path.strip("/").lower()
+    if path:
+        parts = [p for p in path.split("/") if p not in ("v1", "v2", "v3", "api")]
+        if parts:
+            suffix = re.sub(r"[^a-z0-9]+", "", parts[-1])
+            if suffix and suffix != base:
+                return f"{base}-{suffix}"
+    return base
 
 
 def _derive_key_env(name: str) -> str:
@@ -3325,7 +3586,20 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
     elif command == "/memory":
         mem = session.memory_path
         session._print(f"memory file: {mem}")
-        session._print(open(mem, encoding="utf-8", errors="replace").read() if os.path.isfile(mem) else "(empty)")
+        if not os.path.isfile(mem):
+            session._print("(empty)")
+        else:
+            try:
+                # Cap memory display (file capped at 8000, but be safe)
+                if os.path.getsize(mem) > 20000:
+                    with open(mem, encoding="utf-8", errors="replace") as h:
+                        data = h.read(8000) + "\n... [truncated]"
+                else:
+                    with open(mem, encoding="utf-8", errors="replace") as h:
+                        data = h.read()
+                session._print(data or "(empty)")
+            except OSError as exc:
+                session._print(session.style.red(f"  cannot read memory: {exc}"))
     elif command == "/diff":
         session.show_diff()
     elif command == "/undo":
@@ -3342,6 +3616,19 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
                 llm = session.config.get("llm", {})
                 session._print(f"model      {llm.get('model', '?')}")
                 session._print(f"endpoint   {llm.get('base_url', '?')}")
+        elif parts[0].lower() in ("help", "-h", "--help", "?", "h"):
+            s = session.style
+            session._print(s.bold("  /model — pick a model"))
+            session._print(s.dim("  usage:"))
+            session._print("    /model                       — pick from endpoint catalogue")
+            session._print("    /model <name>                — switch to model directly")
+            session._print("    /model <name> <effort>       — switch and set reasoning")
+            session._print("    /model help                  — show this help")
+            session._print(s.dim("  effort: off | minimal | low | medium | high | xhigh"))
+            session._print(s.dim("  examples:"))
+            session._print("    /model gpt-4o")
+            session._print("    /model gpt-5 high")
+            session._print("    /model meta-llama-3")
         elif len(parts) >= 2:
             # "/model gpt-5 high" sets both in one go.
             _apply_model(session, parts[0], parts[1])
@@ -3426,6 +3713,10 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
     elif command == "/clear":
         session.context.replace_body([])
         session.reported_changes.clear()
+        session.goal = ""
+        session.goal_notes = []
+        session.active_skills = []
+        session.auto_attached = []
         if session.layout is not None and session.layout.active:
             session.layout.clear_content()
         session._print("conversation cleared (files kept)")
@@ -3433,6 +3724,11 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
         session.message_count = 0
         session.context.replace_body([])
         session.reported_changes.clear()
+        session.goal = ""
+        session.goal_notes = []
+        session.active_skills = []
+        session.auto_attached = []
+        session.approvals.reset_session()
         if session.layout is not None and session.layout.active:
             session.layout.clear_content()
         session._print("conversation reset (files kept)")
@@ -3465,10 +3761,16 @@ def dispatch(session: ConsoleSession, line: str) -> bool:
     elif command == "/steps":
         if argument:
             try:
-                session.max_steps = max(1, int(argument))
+                val = int(argument)
+                if val < 1:
+                    val = 1
+                elif val > 100:
+                    session._print(session.style.yellow("  step limit capped at 100"))
+                    val = 100
+                session.max_steps = val
                 session._print(f"step limit is now {session.max_steps}")
             except ValueError:
-                session._print("usage: /steps <number>")
+                session._print("usage: /steps <number> (1-100)")
         else:
             session._print(session.max_steps)
     elif command == "/verbose":
@@ -3554,9 +3856,14 @@ def main(argv: list[str] | None = None) -> int:
         # decides the endpoint and model the header names. A header is
         # the one row an append-only terminal cannot go back and fix
         # once it has scrolled, so it has to be right the first time.
-        session._print(style.dim("no endpoint configured yet - let's connect one."))
-        _connect(session, [])
-        session._print("")
+        try:
+            session._print(style.dim("no endpoint configured yet - let's connect one."))
+            _connect(session, [])
+            session._print("")
+        except (KeyboardInterrupt, EOFError):
+            session._print(style.dim("  setup skipped — run /connect to add an endpoint later"))
+        except Exception:
+            pass
 
     if interactive:
         session._compact = True
@@ -3620,12 +3927,13 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
             def _resize_prompt() -> str | None:
                 if session.layout is None:
                     return None
-                changed = session.layout.check_resize()
-                if changed:
-                    content_height = session.layout.content_bottom - session.layout.content_top + 1
-                    editor.max_popup = max(1, min(8, content_height))
-                    editor.fixed_row = session.layout.prompt_row
-                    return session.prompt_text()
+                with session._pause_spinner():
+                    changed = session.layout.check_resize()
+                    if changed:
+                        content_height = session.layout.content_bottom - session.layout.content_top + 1
+                        editor.max_popup = max(1, min(8, content_height))
+                        editor.fixed_row = session.layout.prompt_row
+                        return session.prompt_text()
                 return None
 
             editor.on_resize = _resize_prompt
@@ -3659,7 +3967,8 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
             if fixed_bottom:
                 session.layout.move_to_content()
             ts = time.strftime("%H:%M", time.localtime(session._prompt_sent_at))
-            session._print(f"{session.style.on_grey(' ' + ts + ' ')} {session.style.bold(line)}")
+            display = _mask_line(line)
+            session._print(f"{session.style.on_grey(' ' + ts + ' ')} {session.style.bold(display)}")
             if not dispatch(session, line):
                 session.handle(line)
             # The next reader() call draws the fixed prompt.

@@ -1,8 +1,6 @@
 # MANTRA known-failure registry
 
-Recurring failure classes the coding agent must not repeat. This file is
-injected into the agent's system prompt. When a bug class is fixed, add one
-entry here so the same class cannot silently return.
+Recurring failure classes injected into the prompt. Add an entry when a class is fixed.
 
 Format:
 
@@ -12,7 +10,7 @@ Format:
 - date: YYYY-MM-DD
 
 ## KF-1 | editing a file that was never read
-- symptom: edit_file applied against assumed content and destroyed correct code.
+- symptom: edit without a prior read corrupted the file.
 - rule: never call edit_file on a path you have not read in this session; the tool enforces this and will reject the edit.
 - date: 2026-08-26
 

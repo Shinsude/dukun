@@ -165,7 +165,18 @@ class ApprovalPolicy:
     def _key(tool: str, arguments: dict[str, Any]) -> str:
         if tool == "run_command":
             command = str(arguments.get("command", "")).strip()
+            # Lowercase for command matching (helps Windows), but keep path case
+            # for file tools below — Linux paths are case-sensitive.
             return f"run_command::{' '.join(command.split()).lower()}"
         if tool in ("write_file", "edit_file"):
-            return f"{tool}::{str(arguments.get('path', '')).lower()}"
+            # Preserve case for Linux; normalize separators via ledger logic
+            p = str(arguments.get("path", "")).replace("\\", "/")
+            # Don't lowercase — `Secret.txt` vs `secret.txt` are different on Linux
+            # Use posix norm for consistent key
+            import posixpath
+
+            p = posixpath.normpath(p)
+            if p == ".":
+                p = ""
+            return f"{tool}::{p}"
         return tool

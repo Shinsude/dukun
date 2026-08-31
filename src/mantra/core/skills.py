@@ -98,7 +98,8 @@ def roots() -> list[Path]:
     override = os.environ.get(_OVERRIDE_ENV, "")
     if override.strip():
         found = []
-        for part in re.split(r"[;:]", override):
+        # Only split on ';' — ':' breaks Windows absolute paths like C:\skills
+        for part in override.split(";"):
             part = part.strip()
             if part:
                 found.append(Path(part))
@@ -494,6 +495,9 @@ def match_bundle(query: str) -> str | None:
     return best_name
 
 
+_GENERIC_NO_AUTO = frozenset({"explain", "project", "workspace", "codebase", "repo", "overview", "summarise", "summarize", "what", "does", "about", "code", "this"})
+
+
 def recommend(query: str) -> tuple[Skill | None, str | None]:
     """What to attach for ``query`` without being asked: (skill, bundle).
 
@@ -501,13 +505,23 @@ def recommend(query: str) -> tuple[Skill | None, str | None]:
     they answer different questions: the skill is what to follow now,
     the bundle is the longer sequence this request might be step one of.
     """
+    # Generic workspace queries like "Explain this project" must not auto-attach help
+    wanted = _stems(query)
+    if wanted and wanted.issubset(_GENERIC_NO_AUTO | {"thi", "what"}):
+        return None, match_bundle(query)
+    # Don't hijack "explain this project" / "what this project does" with help skill
+    if wanted and "project" in wanted and len(wanted) <= 3:
+        return None, match_bundle(query)
     ranked = route(query, limit=6)
     best: Skill | None = None
     if ranked:
         top, top_score = ranked[0]
+        # Never auto-attach generic help for vague queries
+        if top.name.lower() == "help" and len(wanted) <= 2:
+            return None, match_bundle(query)
         runner = ranked[1][1] if len(ranked) > 1 else 0.0
         weights = _idf(list_skills(), routing_table())
-        total = _query_weight(_stems(query), weights)
+        total = _query_weight(wanted, weights)
         if top_score / total >= _CONFIDENCE and top_score >= runner * _MARGIN:
             best = top
     return best, match_bundle(query)

@@ -23,6 +23,9 @@ from mantra.interfaces.sandbox import ExecResult, Sandbox
 _TRAVERSAL_RE = re.compile(r"(\.\.[\\/]|[\\/]\.\.)")
 _ABSOLUTE_WIN_RE = re.compile(r"[a-zA-Z]:[\\/]")
 
+_MAX_READ_BYTES = 500_000
+_MAX_EXEC_BYTES = 1_000_000
+
 
 def _contains_traversal(command: str) -> bool:
     """Heuristic check for shell commands that likely escape the workspace.
@@ -37,8 +40,15 @@ def _contains_traversal(command: str) -> bool:
         return False
     # Skip checks for URL like strings inside the command to avoid
     # flagging https:// as an absolute path. Strip URL schemes before test.
-    stripped = re.sub(r"https?://[^\s]+", "", command)
-    stripped = re.sub(r"file://[^\s]+", "", stripped)
+    stripped = re.sub(r"https?://[^\s]+", "", command, flags=re.IGNORECASE)
+    stripped = re.sub(r"file://[^\s]+", "", stripped, flags=re.IGNORECASE)
+    # Block home-directory expansion which escapes the workspace via shell
+    if re.search(r"(?:^|[\s\"'`;|&])~", stripped):
+        return True
+    if re.search(r"\$(?:HOME|USERPROFILE|HOMEPATH)", stripped, flags=re.IGNORECASE):
+        return True
+    if re.search(r"%\s*USERPROFILE\s*%", stripped, flags=re.IGNORECASE):
+        return True
     # Block any parent directory reference, even without slash like `cd ..`
     # or `dir ..` which still escapes the workspace.
     if ".." in stripped:
@@ -117,6 +127,13 @@ class LocalSandbox(Sandbox):
         abort = getattr(self, "abort", None)
         if abort is not None and abort.is_set():
             raise AbortError("interrupted by operator")
+        # Validate timeout is sane
+        try:
+            timeout_f = float(timeout)
+        except (TypeError, ValueError):
+            return ExecResult(exit_code=-1, stdout="", stderr=f"invalid timeout {timeout!r}", timed_out=False)
+        if timeout_f <= 0 or timeout_f > 600:
+            return ExecResult(exit_code=-1, stdout="", stderr="timeout out of range (0,600]", timed_out=False)
         if _contains_traversal(command):
             return ExecResult(
                 exit_code=-1,
@@ -136,7 +153,7 @@ class LocalSandbox(Sandbox):
                 errors="replace",
             )
             interval = 0.1
-            deadline = time.monotonic() + float(timeout)
+            deadline = time.monotonic() + timeout_f
             while True:
                 if abort is not None and abort.is_set():
                     try:
@@ -150,6 +167,11 @@ class LocalSandbox(Sandbox):
                     raise AbortError("interrupted by operator")
                 try:
                     stdout, stderr = proc.communicate(timeout=interval)
+                    # Cap output to prevent OOM (host still buffers, but truncate)
+                    if stdout and len(stdout) > _MAX_EXEC_BYTES:
+                        stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
+                    if stderr and len(stderr) > _MAX_EXEC_BYTES:
+                        stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
                     return ExecResult(
                         exit_code=proc.returncode,
                         stdout=stdout or "",
@@ -162,6 +184,10 @@ class LocalSandbox(Sandbox):
                             stdout, stderr = proc.communicate(timeout=2)
                         except Exception:
                             stdout, stderr = "", ""
+                        if stdout and len(stdout) > _MAX_EXEC_BYTES:
+                            stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
+                        if stderr and len(stderr) > _MAX_EXEC_BYTES:
+                            stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
                         return ExecResult(
                             exit_code=-1,
                             stdout=stdout or "",
@@ -174,10 +200,26 @@ class LocalSandbox(Sandbox):
 
     def read_file(self, path: str) -> str:
         full = self._resolve(path)
-        with open(full, "r", encoding="utf-8", errors="replace") as handle:
-            return handle.read()
+        # Cap read to avoid OOM on huge files
+        try:
+            # Use os.path.getsize check first if available
+            try:
+                if os.path.getsize(full) > _MAX_READ_BYTES:
+                    with open(full, "r", encoding="utf-8", errors="replace") as handle:
+                        return handle.read(_MAX_READ_BYTES) + "\n... [truncated]"
+            except OSError:
+                pass
+            with open(full, "r", encoding="utf-8", errors="replace") as handle:
+                data = handle.read(_MAX_READ_BYTES + 1)
+                if len(data) > _MAX_READ_BYTES:
+                    return data[:_MAX_READ_BYTES] + "\n... [truncated]"
+                return data
+        except OSError as exc:
+            raise SandboxError(str(exc)) from exc
 
     def write_file(self, path: str, content: str) -> None:
+        if len(content) > _MAX_READ_BYTES * 2:
+            raise SandboxError(f"content too large ({len(content)} bytes)")
         full = self._resolve(path)
         parent = os.path.dirname(full)
         if parent:
@@ -187,10 +229,33 @@ class LocalSandbox(Sandbox):
             real_base = os.path.realpath(self.root)
             if not (real_parent == real_base or real_parent.startswith(real_base + os.sep)):
                 raise SandboxError(f"path escapes sandbox workspace: {path}")
+            # Additional component-wise symlink check to narrow race window
+            cur = parent
+            while cur and cur != real_base and cur.startswith(real_base):
+                if os.path.islink(cur):
+                    raise SandboxError(f"path escapes sandbox workspace: {path}")
+                nxt = os.path.dirname(cur)
+                if nxt == cur:
+                    break
+                cur = nxt
             # Also re-resolve full path after parent creation
             full = self._resolve(path)
-        with open(full, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(content)
+            # Atomic write via temp file to avoid partial writes
+        # Use atomic tmp+replace to reduce race
+        tmp = full + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(content)
+            os.replace(tmp, full)
+        except OSError:
+            # Fallback direct
+            with open(full, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(content)
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
         self.changed.add(path.replace("\\", "/"))
 
     def cleanup(self) -> None:
@@ -218,6 +283,12 @@ class LocalSandbox(Sandbox):
         if abort is not None and abort.is_set():
             raise AbortError("interrupted by operator")
         try:
+            timeout_f = float(timeout)
+        except (TypeError, ValueError):
+            return ExecResult(exit_code=-1, stdout="", stderr=f"invalid timeout {timeout!r}", timed_out=False)
+        if timeout_f <= 0 or timeout_f > 600:
+            return ExecResult(exit_code=-1, stdout="", stderr="timeout out of range", timed_out=False)
+        try:
             proc = subprocess.Popen(
                 args,
                 cwd=self.root,
@@ -227,7 +298,7 @@ class LocalSandbox(Sandbox):
                 errors="replace",
             )
             interval = 0.1
-            deadline = time.monotonic() + float(timeout)
+            deadline = time.monotonic() + timeout_f
             while True:
                 if abort is not None and abort.is_set():
                     try:
@@ -241,6 +312,10 @@ class LocalSandbox(Sandbox):
                     raise AbortError("interrupted by operator")
                 try:
                     stdout, stderr = proc.communicate(timeout=interval)
+                    if stdout and len(stdout) > _MAX_EXEC_BYTES:
+                        stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
+                    if stderr and len(stderr) > _MAX_EXEC_BYTES:
+                        stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
                     return ExecResult(
                         exit_code=proc.returncode,
                         stdout=stdout or "",
@@ -253,6 +328,10 @@ class LocalSandbox(Sandbox):
                             stdout, stderr = proc.communicate(timeout=2)
                         except Exception:
                             stdout, stderr = "", ""
+                        if stdout and len(stdout) > _MAX_EXEC_BYTES:
+                            stdout = stdout[:_MAX_EXEC_BYTES] + "\n... [truncated]"
+                        if stderr and len(stderr) > _MAX_EXEC_BYTES:
+                            stderr = stderr[:_MAX_EXEC_BYTES] + "\n... [truncated]"
                         return ExecResult(
                             exit_code=-1,
                             stdout=stdout or "",

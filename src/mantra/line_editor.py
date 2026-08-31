@@ -19,31 +19,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
+# Re-export shared primitives so every module agrees on width and size.
+# Previously this file counted wide chars (2 cols) while console/compact
+# counted 1, causing cursor drift for CJK paths. Centralised in term.py.
+from mantra.term import term_size, visible_len  # noqa: F401
+
 _ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
-
-
-def _char_width(ch: str) -> int:
-    """Return the display width of a single character.
-
-    CJK ideographs and some emoji occupy 2 terminal columns.
-    """
-    import unicodedata
-    eaw = unicodedata.east_asian_width(ch)
-    if eaw in ("W", "F"):
-        return 2
-    if eaw == "Na":
-        return 1
-    # Ambiguous width: treat as 1 in most Western locales.
-    return 1
-
-
-def visible_len(text: str) -> int:
-    """Visible width of *text* after stripping ANSI escape sequences.
-
-    Correctly accounts for wide characters (CJK, emoji) that occupy
-    two terminal columns.
-    """
-    return sum(_char_width(c) for c in _ANSI_RE.sub("", text))
 
 
 # Key constants for special keys that don't map to a single character.
@@ -148,7 +129,11 @@ class LineEditor:
         self.fixed_row: int | None = None
         self._prev_fixed_row: int | None = None
 
-    # ΓöÇΓöÇ public API ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+        # Track terminal size for resize detection without side effects.
+        self._term_cols: int | None = None
+        self._term_rows: int | None = None
+
+    # ── public API ────────────────────────────────────────────
 
     def read(self, prompt: str = "", skip_newline: bool = False) -> str:
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -237,12 +222,16 @@ class LineEditor:
                             popup, selected = self._recompute(buffer, cursor, selected)
                     elif key == KEY_LEFT:
                         cursor = max(0, cursor - 1)
+                        popup, selected = self._recompute(buffer, cursor, selected)
                     elif key == KEY_RIGHT:
                         cursor = min(len(buffer), cursor + 1)
+                        popup, selected = self._recompute(buffer, cursor, selected)
                     elif key == KEY_HOME:
                         cursor = 0
+                        popup, selected = self._recompute(buffer, cursor, selected)
                     elif key == KEY_END:
                         cursor = len(buffer)
+                        popup, selected = self._recompute(buffer, cursor, selected)
                     elif key == KEY_DELETE:
                         buffer = buffer[:cursor] + buffer[cursor + 1 :]
                         popup, selected = self._recompute(buffer, cursor, selected)
@@ -282,7 +271,7 @@ class LineEditor:
 
         return buffer
 
-    # ΓöÇΓöÇ completion ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    # ── completion ────────────────────────────────────────────
 
     def _recompute(self, buffer: str, cursor: int, selected: int):
         if self.completer is None or self._dismissed or self.no_popup:
@@ -296,126 +285,151 @@ class LineEditor:
         self._last_token = token
         return completion, min(selected, len(completion.items) - 1)
 
-    # ΓöÇΓöÇ rendering ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    # ── rendering ─────────────────────────────────────────────
 
     def _draw(self, prompt, buffer, cursor, popup, selected, drawn) -> int:
         out = sys.stdout
-        import shutil
 
         # Auto-compute fixed_row if not set externally.
         if self.popup_above and self.fixed_row is None:
             try:
-                self.fixed_row = shutil.get_terminal_size().lines
+                _, rows = term_size()
+                self.fixed_row = rows
             except Exception:
                 pass
 
         # If fixed_row moved (resize), clear old prompt row that is now inside content
         if self.fixed_row is not None and self._prev_fixed_row is not None and self.fixed_row != self._prev_fixed_row:
             out.write(f"\033[{self._prev_fixed_row};1H\033[2K")
+            # Also clear old popup rows at their previous absolute positions
+            if drawn > 0 and self.popup_above:
+                for i in range(drawn):
+                    # Old popup ended at old_fixed_row-2 (content_bottom), not -1
+                    row = self._prev_fixed_row - i - 2
+                    if row >= 1:
+                        out.write(f"\033[{row};1H\033[2K")
         self._prev_fixed_row = self.fixed_row
 
-        # Step 1: Clear old popup rows. Use absolute rows when a fixed
-        # bottom prompt is active (no newlines inside scroll region), else
-        # use relative moves. Always clear the prompt line first.
-        if drawn > 0 and self.fixed_row is not None and self.popup_above:
-            for i in range(drawn):
-                row = self.fixed_row - i - 1
-                if row >= 1:
-                    out.write(f"\033[{row};1H\033[2K")
-            out.write("\r\033[K")
-        else:
-            out.write("\r\033[K")
-            if self.popup_above and drawn:
-                for _ in range(drawn):
-                    out.write("\033[1A\r\033[K")
-            elif drawn:
-                for _ in range(drawn):
-                    out.write("\033[1B\r\033[K")
-                for _ in range(drawn):
-                    out.write("\033[1A")
+        # Ensure cursor is on the prompt row before any clearing,
+        # preventing a flash in the content area.
+        if self.popup_above and self.fixed_row is not None:
+            out.write(f"\033[{self.fixed_row};1H")
 
-        # Step 2: Restore content rows that were corrupted by popup.
-        if drawn > 0 and self.on_before_draw is not None:
-            try:
-                self.on_before_draw(drawn)
-            except Exception:
-                pass
-
-        # Step 3: Write the prompt (contains absolute positioning).
-        out.write(prompt)
-
-        # Step 4: Clip buffer to prevent bottom-row wrapping.
+        # Wrap all drawing in synchronized output to prevent flicker.
+        out.write("\033[?2026h")
         try:
-            cols = shutil.get_terminal_size().columns
-        except Exception:
-            cols = 80
-
-        pvis = visible_len(prompt)
-        space = max(0, cols - pvis)
-
-        if space <= 0:
-            shown = ""
-            cpos = 0
-        elif len(buffer) <= space:
-            shown = buffer
-            cpos = cursor
-        else:
-            start = max(0, cursor - space + 1)
-            shown = buffer[start : start + space]
-            cpos = cursor - start
-
-        out.write(shown)
-
-        # Step 5: Draw popup above the prompt.
-        rows: list[str] = []
-        if popup:
-            for index in range(min(self.max_popup, len(popup.items))):
-                label = popup.label(index)
-                if index == selected:
-                    rows.append(f"  {self.style.cyan('> ' + label)}")
-                else:
-                    rows.append(f"    {self.style.dim(label)}")
-
-            if len(popup.items) > self.max_popup:
-                rows.append(self.style.dim(f"    ... {len(popup.items) - self.max_popup} more"))
-
-            if self.hint:
-                rows.append(self.style.dim("    " + self.hint))
-
-        if rows and self.popup_above:
-            n = len(rows)
-            if self.fixed_row is not None:
-                # Clamp popup so it never goes above row 1 (content_top).
-                max_popup_rows = max(0, self.fixed_row - 1)
-                if n > max_popup_rows:
-                    rows = rows[-max_popup_rows:]
-                    n = len(rows)
-                for i, row_text in enumerate(rows):
-                    row = self.fixed_row - n + i
+            # Step 1: Clear old popup rows. Use absolute rows when a fixed
+            # bottom prompt is active (no newlines inside scroll region), else
+            # use relative moves. Always clear the prompt line first.
+            # Popup occupies rows fixed_row-2 .. fixed_row-n-1 (content_bottom
+            # is fixed_row-2, border is fixed_row-1, prompt is fixed_row).
+            if drawn > 0 and self.fixed_row is not None and self.popup_above:
+                for i in range(drawn):
+                    row = self.fixed_row - i - 2
                     if row >= 1:
-                        out.write(f"\033[{row};1H\033[2K{row_text}")
-                out.write(f"\033[{self.fixed_row};1H")   # absolute: move cursor to prompt row
+                        out.write(f"\033[{row};1H\033[2K")
+                out.write("\r\033[K")
             else:
-                out.write(f"\033[{n}A")
-                for i, row_text in enumerate(rows):
-                    out.write("\r\033[2K" + row_text)
-                    if i < n - 1:
-                        out.write("\n")
-                out.write("\033[1B")
+                out.write("\r\033[K")
+                if self.popup_above and drawn:
+                    for _ in range(drawn):
+                        out.write("\033[1A\r\033[K")
+                elif drawn:
+                    for _ in range(drawn):
+                        out.write("\033[1B\r\033[K")
+                    for _ in range(drawn):
+                        out.write("\033[1A")
 
-        elif rows:
-            for row in rows:
-                out.write("\n\033[K")
-                out.write(row)
-            out.write(f"\033[{len(rows)}A")
+            # Step 2: Restore content rows that were corrupted by popup.
+            if drawn > 0 and self.on_before_draw is not None:
+                try:
+                    self.on_before_draw(drawn)
+                except Exception:
+                    pass
 
-        # Step 6: Position cursor at the typed text position.
-        out.write("\r")
-        remaining = pvis + cpos
-        if remaining:
-            out.write(f"\033[{remaining}C")
+            # Step 3: Write the prompt (contains absolute positioning).
+            out.write(prompt)
 
-        out.flush()
+            # Step 4: Clip buffer to prevent bottom-row wrapping.
+            try:
+                cols, _ = term_size()
+            except Exception:
+                cols = 80
+
+            pvis = visible_len(prompt)
+            space = max(0, cols - pvis)
+
+            if space <= 0:
+                shown = ""
+                cpos = 0
+            elif len(buffer) <= space:
+                shown = buffer
+                cpos = cursor
+            else:
+                start = max(0, cursor - space + 1)
+                shown = buffer[start : start + space]
+                cpos = cursor - start
+
+            out.write(shown)
+
+            # Step 5: Draw popup above the prompt.
+            rows: list[str] = []
+            if popup:
+                for index in range(min(self.max_popup, len(popup.items))):
+                    label = popup.label(index)
+                    if index == selected:
+                        rows.append(f"  {self.style.cyan('> ' + label)}")
+                    else:
+                        rows.append(f"    {self.style.dim(label)}")
+
+                if len(popup.items) > self.max_popup:
+                    rows.append(self.style.dim(f"    ... {len(popup.items) - self.max_popup} more"))
+
+                if self.hint:
+                    rows.append(self.style.dim("    " + self.hint))
+
+            if rows and self.popup_above:
+                n = len(rows)
+                if self.fixed_row is not None:
+                    # Clamp popup so it never overlaps info border (row 2) or
+                    # border row (fixed_row-1). Available = fixed_row-4
+                    # (content height). Uses fixed_row-2 as content_bottom.
+                    max_popup_rows = max(0, self.fixed_row - 4)
+                    # Also respect max_popup already limited by repl to content height
+                    max_popup_rows = min(max_popup_rows, self.max_popup) if self.max_popup else max_popup_rows
+                    if n > max_popup_rows:
+                        rows = rows[-max_popup_rows:]
+                        n = len(rows)
+                    # Anchor popup to content_bottom (fixed_row-2), not border
+                    for i, row_text in enumerate(rows):
+                        row = self.fixed_row - 2 - n + 1 + i
+                        if row >= 1:
+                            out.write(f"\033[{row};1H\033[2K{row_text}")
+                    out.write(f"\033[{self.fixed_row};1H")   # absolute: move cursor to prompt row
+                else:
+                    out.write(f"\033[{n}A")
+                    for i, row_text in enumerate(rows):
+                        out.write("\r\033[2K" + row_text)
+                        if i < n - 1:
+                            out.write("\n")
+                    out.write("\033[1B")
+
+            elif rows:
+                for row in rows:
+                    out.write("\n\033[K")
+                    out.write(row)
+                out.write(f"\033[{len(rows)}A")
+
+            # Step 6: Position cursor at the typed text position.
+            out.write("\r")
+            remaining = pvis + cpos
+            if remaining:
+                out.write(f"\033[{remaining}C")
+
+        finally:
+            out.write("\033[?2026l")
+            out.flush()
+
         return len(rows)
 
     def _finish(self, drawn: int, skip_newline: bool = False) -> None:
@@ -424,7 +438,7 @@ class LineEditor:
         if drawn:
             if self.popup_above and self.fixed_row is not None:
                 for i in range(drawn):
-                    row = self.fixed_row - i - 1
+                    row = self.fixed_row - i - 2
                     if row >= 1:
                         out.write(f"\033[{row};1H\033[2K")
                 out.write(f"\033[{self.fixed_row};1H")
@@ -452,7 +466,7 @@ class LineEditor:
 
         out.flush()
 
-    # ΓöÇΓöÇ key input ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    # ── key input ─────────────────────────────────────────────
 
     @contextmanager
     def _raw_mode(self):
@@ -478,14 +492,16 @@ class LineEditor:
             import msvcrt
             import time
 
-            # Poll for terminal resize while waiting for input.
             while not msvcrt.kbhit():
-                if self.on_resize is not None:
-                    try:
-                        if self.on_resize():
-                            return KEY_RESIZE
-                    except Exception:
-                        pass
+                try:
+                    cols, rows = term_size()
+                    if (self._term_cols is None or self._term_rows is None):
+                        self._term_cols, self._term_rows = cols, rows
+                    elif cols != self._term_cols or rows != self._term_rows:
+                        self._term_cols, self._term_rows = cols, rows
+                        return KEY_RESIZE
+                except Exception:
+                    pass
                 time.sleep(0.05)
 
             char = msvcrt.getwch()
@@ -507,14 +523,19 @@ class LineEditor:
                 ready, _, _ = select.select([sys.stdin], [], [], 0.05)
             except (OSError, ValueError):
                 ready = [sys.stdin]
+
+            try:
+                cols, rows = term_size()
+                if (self._term_cols is None or self._term_rows is None):
+                    self._term_cols, self._term_rows = cols, rows
+                elif cols != self._term_cols or rows != self._term_rows:
+                    self._term_cols, self._term_rows = cols, rows
+                    return KEY_RESIZE
+            except Exception:
+                pass
+
             if ready:
                 break
-            if self.on_resize is not None:
-                try:
-                    if self.on_resize():
-                        return KEY_RESIZE
-                except Exception:
-                    pass
 
         char = sys.stdin.read(1)
         if char != "\x1b":

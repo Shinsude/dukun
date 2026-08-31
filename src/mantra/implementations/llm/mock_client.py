@@ -7,10 +7,13 @@ key or network access.
 
 from __future__ import annotations
 
+import copy
 import types
 
 from mantra.core.exceptions import LLMError
 from mantra.interfaces.llm_client import LLMClient, LLMResponse, ToolCall
+
+_call_counter = 0
 
 
 class ScriptedLLMClient(LLMClient):
@@ -21,7 +24,7 @@ class ScriptedLLMClient(LLMClient):
         self.received_messages: list[list[dict]] = []
 
     def chat(self, messages, tools=None, on_delta=None) -> LLMResponse:
-        self.received_messages.append(messages)
+        self.received_messages.append(copy.deepcopy(messages))
         if not self.script:
             raise LLMError("scripted LLM exhausted before the run finished")
         return self.script.pop(0)
@@ -29,8 +32,10 @@ class ScriptedLLMClient(LLMClient):
 
 def tool_call_response(name: str, arguments: dict) -> LLMResponse:
     """Helper to build a one-tool-call response."""
+    global _call_counter
+    _call_counter += 1
     return LLMResponse(
-        tool_calls=[ToolCall(id=f"call_{name}_{id(arguments) & 0xFFFF}", name=name, arguments=arguments)]
+        tool_calls=[ToolCall(id=f"call_{name}_{_call_counter}", name=name, arguments=arguments)]
     )
 
 

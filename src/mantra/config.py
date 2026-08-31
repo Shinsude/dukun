@@ -13,21 +13,18 @@ import os
 
 from mantra.core.exceptions import ConfigError
 
-# Thinking budget for reasoning models. Ordered: each is more thorough
-# and slower than the one before. None means "do not send the field".
+# Reasoning effort levels, ordered from fastest to most thorough. None omits the field.
 REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 DEFAULTS = {
     "system_prompt": None,  # falls back to the loop default
     "max_steps": 30,
-    # The message budget lives under "context"; a second copy here was
-    # ignored by every reader and misled anyone editing the file.
+    # Message budget is defined only under context.
     "llm": {
         "provider": "openai",
         "model": "gpt-4o",
         "api_key_env": "OPENAI_API_KEY",
-        # Optional thinking budget for reasoning models. null sends
-        # nothing at all, which is what non-reasoning endpoints expect.
+        # Reasoning effort. Null omits the field for non-reasoning endpoints.
         "reasoning_effort": None,
     },
     "sandbox": {"provider": "local"},
@@ -45,11 +42,7 @@ DEFAULTS = {
     ],
     "evaluator": {"type": "command", "test_cmd": "python -m pytest tests/ -q"},
     "logging": {"type": "jsonl", "path": "logs/mantra-run.jsonl"},
-    # Interactive-session behaviour (the headless CLI ignores these).
-    # The strictest mode: read-only work runs unattended, anything that
-    # mutates or destroys is put to the operator first. The permissive
-    # mode is one /approve away for anyone who wants it, but shipping it
-    # as the default meant a misclassified command ran with no prompt.
+    # Interactive defaults use the strictest approval mode.
     "approvals": "default",  # default | auto | yolo | plan
     "context": {"max_messages": 200, "max_chars": 240000},
     "auto_compact_tokens": 60000,  # summarise the history past this size; 0 disables
@@ -128,8 +121,9 @@ def merge_defaults(data: dict) -> dict:
     tools = merged.get("tools")
     if not isinstance(tools, list) or not tools:
         raise ConfigError("config must list at least one tool")
-    bad_tool = next((t for t in tools if not isinstance(t, str) or not t.strip()), None)
-    if bad_tool is not None:
+    _sentinel = object()
+    bad_tool = next((t for t in tools if not isinstance(t, str) or not t.strip()), _sentinel)
+    if bad_tool is not _sentinel:
         raise ConfigError(f"config tools must be non-empty names, got {bad_tool!r}")
     steps = merged.get("max_steps", 30)
     if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
@@ -145,6 +139,16 @@ def merge_defaults(data: dict) -> dict:
             f"config llm.reasoning_effort must be one of "
             f"{'/'.join(REASONING_EFFORTS)} or null, got '{effort}'"
         )
+    ctx = merged.get("context")
+    if ctx is not None and not isinstance(ctx, dict):
+        raise ConfigError("config context must be an object")
+    if isinstance(ctx, dict):
+        mm = ctx.get("max_messages")
+        if mm is not None and (not isinstance(mm, int) or isinstance(mm, bool) or mm < 4):
+            raise ConfigError(f"config context.max_messages must be an integer >=4, got {mm!r}")
+        mc = ctx.get("max_chars")
+        if mc is not None and (not isinstance(mc, int) or isinstance(mc, bool) or mc < 2000):
+            raise ConfigError(f"config context.max_chars must be an integer >=2000, got {mc!r}")
     return merged
 
 

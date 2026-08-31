@@ -38,8 +38,8 @@ _OVERRIDE_ENV = "MANTRA_SESSIONS"
 def sessions_dir() -> Path:
     """Where saved sessions live. Created on demand."""
     override = os.environ.get(_OVERRIDE_ENV)
-    if override:
-        target = Path(override)
+    if override and override.strip():
+        target = Path(override.strip())
     else:
         target = Path.home() / ".mantra" / "sessions"
     try:
@@ -78,7 +78,15 @@ def derive_name(workspace: str = "", model: str = "") -> str:
 
 
 def _path(name: str) -> Path:
-    return sessions_dir() / f"{name}.json"
+    # Sanitize name to prevent path traversal (e.g. ../../etc/passwd)
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "-", name).strip("-._")
+    # Also handle slug-style but keep original if safe
+    if not safe or safe != name:
+        # Use slug fallback for unsafe names, but preserve extension handling
+        safe = _slug(name) or "session"
+    # Prevent directory traversal via Path
+    safe = Path(safe).name
+    return sessions_dir() / f"{safe}.json"
 
 
 # A transcript is rewritten after every turn, so without a ceiling both

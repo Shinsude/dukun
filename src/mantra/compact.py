@@ -1,21 +1,16 @@
-"""Compact TUI — viewport-based layout with pinned bottom prompt for MANTRA.
-
-Screen model:
-    content_top .. content_bottom   scrollable viewport (internal buffer)
-    border_row                      spinner / border / transient status
-    prompt_row                      fixed prompt
-
-Content is stored in an internal viewport buffer. It is not written directly
+"""Compact layout with viewport buffer, status border, and fixed bottom prompt.
 to the terminal as normal scrollback. The prompt is always the last row.
 """
 
 from __future__ import annotations
 
 import re
-import shutil
 import sys
 import threading
 from typing import Any
+
+from mantra.term import term_size as _term_size
+from mantra.term import visible_len as _vis
 
 _ANSI_RE = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
 
@@ -33,10 +28,6 @@ def _bold(t, e=True): return _ansi("1", t, e)
 def _gold(t, e=True): return _ansi("93", t, e)
 
 
-def _vis(text: str) -> int:
-    return len(_ANSI_RE.sub("", text))
-
-
 def _pad(text: str, width: int) -> str:
     diff = width - _vis(text)
     return text + (" " * max(0, diff))
@@ -48,7 +39,7 @@ def _shorten(text: str, width: int) -> str:
     if _vis(text) <= width:
         return text
     if width == 1:
-        return "…"
+        return "..."
     result: list[str] = []
     vis = 0
     limit = width - 1
@@ -60,12 +51,13 @@ def _shorten(text: str, width: int) -> str:
             i = m.end()
             continue
         ch = text[i]
-        if vis + 1 > limit:
+        w = _vis(ch)
+        if vis + w > limit:
             break
         result.append(ch)
-        vis += 1
+        vis += w
         i += 1
-    result.append("…")
+    result.append("...")
     return "".join(result)
 
 
@@ -75,54 +67,6 @@ def _fit_line(text: str, width: int) -> str:
     if _vis(text) <= width:
         return text
     return _shorten(text, width)
-
-
-def _term_size() -> tuple[int, int]:
-    """Return the visible terminal viewport size.
-
-    Windows Terminal can keep a console buffer larger than the visible
-    window. Query the active console window rectangle first so restore/
-    maximize transitions are reflected immediately.
-    """
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            class _Coord(ctypes.Structure):
-                _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
-
-            class _Rect(ctypes.Structure):
-                _fields_ = [
-                    ("Left", wintypes.SHORT), ("Top", wintypes.SHORT),
-                    ("Right", wintypes.SHORT), ("Bottom", wintypes.SHORT),
-                ]
-
-            class _ConsoleInfo(ctypes.Structure):
-                _fields_ = [
-                    ("Size", _Coord), ("Cursor", _Coord),
-                    ("Attributes", wintypes.WORD), ("Window", _Rect),
-                    ("MaximumWindowSize", _Coord),
-                ]
-
-            info = _ConsoleInfo()
-            handle = ctypes.windll.kernel32.GetStdHandle(-11)
-            if handle not in (0, -1):
-                ok = ctypes.windll.kernel32.GetConsoleScreenBufferInfo(
-                    handle, ctypes.byref(info)
-                )
-                if ok:
-                    cols = max(1, info.Window.Right - info.Window.Left + 1)
-                    rows = max(1, info.Window.Bottom - info.Window.Top + 1)
-                    return cols, rows
-        except Exception:
-            pass
-
-    try:
-        s = shutil.get_terminal_size()
-        return max(1, s.columns), max(1, s.lines)
-    except Exception:
-        return 80, 24
 
 
 def _version(session: Any) -> str:
@@ -302,8 +246,8 @@ class CompactLayout:
         self.info_row = 1
         self.info_border_row = 2
         self.content_top = 1 + self.RESERVED_TOP
-        self.border_row = max(1, rows - 1)
-        self.prompt_row = max(1, rows)
+        self.border_row = max(1, rows - 1)  # second‑to‑last line
+        self.prompt_row = max(1, rows)      # last line
         self.content_bottom = max(self.content_top, rows - self.RESERVED_BOTTOM)
         self.active = (
             rows >= 8
@@ -363,7 +307,7 @@ class CompactLayout:
         with _UI_LOCK:
             self._render_content_locked()
 
-    def _render_content_locked(self) -> None:
+    def _render_content_locked(self, _sync: bool = True) -> None:
         if not self.active:
             return
 
@@ -386,7 +330,8 @@ class CompactLayout:
         # Temporarily remove scroll region to draw freely.
         _safe_write("\033[r")
         # Synchronized output — prevent flicker on fast redraws.
-        _safe_write("\033[?2026h")
+        if _sync:
+            _safe_write("\033[?2026h")
         try:
             if self._last_visible is None or len(self._last_visible) != height:
                 # Full repaint.
@@ -402,7 +347,8 @@ class CompactLayout:
 
             self._last_visible = new_visible
         finally:
-            _safe_write("\033[?2026l")  # end synchronized output
+            if _sync:
+                _safe_write("\033[?2026l")  # end synchronized output
         sys.stdout.flush()
         self._apply_region_locked()
 
@@ -515,6 +461,7 @@ class CompactLayout:
         # Draw top info bar.
         self._draw_info_bar_locked()
 
+        # Clear border row (second-to-last row).
         _safe_write(f"\033[{self.border_row};1H\033[2K")
 
         # Border line.
@@ -637,11 +584,16 @@ class CompactLayout:
             if not self._alt:
                 self._enter_locked()
 
-            _safe_write("\033[2J\033[H")
-            self._draw_chrome_locked(skip_prompt=False)
-            self._render_content_locked()
-            self._apply_region_locked()
-
+            # ✅ Wrap entire redraw in synchronized output to prevent flicker
+            _safe_write("\033[?2026h")
+            try:
+                _safe_write("\033[2J\033[H")
+                self._draw_chrome_locked(skip_prompt=True)   # Do NOT draw prompt here; editor will
+                self._render_content_locked(_sync=False)
+                self._apply_region_locked()
+            finally:
+                _safe_write("\033[?2026l")
+            sys.stdout.flush()
             return True
 
     # ── cursor helpers ────────────────────────────────────────

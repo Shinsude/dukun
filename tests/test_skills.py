@@ -308,7 +308,7 @@ class CommandTest(unittest.TestCase):
 
     def test_bundles_are_listed_in_order(self):
         _skills(self.session, "bundles")
-        self.assertIn("debug → tdd → verify", self._shown())
+        self.assertIn("debug > tdd > verify", self._shown())
 
     def test_find_routes_a_request(self):
         _skills(self.session, "find reproduce a failure")

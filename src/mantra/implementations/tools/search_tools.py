@@ -39,33 +39,57 @@ class SearchCodeTool(Tool):
     def execute(self, sandbox: Sandbox, query: str) -> str:
         if "\x00" in query or "\n" in query or "\r" in query:
             return "ERROR: query contains invalid characters"
+        if len(query) > 500:
+            return "ERROR: query too long"
         root = getattr(sandbox, "root", None)
         if root is None:
             # Fall back to shell grep for sandboxes without a file view.
-            # Use shlex.quote for safe shell quoting and reject obvious meta.
-            if len(query) > 500:
-                return "ERROR: query too long"
-            # Still escape single quotes for the inner single-quoted string
-            escaped = query.replace("'", "'\\''")
-            # Validate that the escaped query does not contain shell meta outside quotes
-            # The grep pattern is inside single quotes, so only ' needed escaping.
-            result = sandbox.exec(f"grep -rn '{escaped}' . --exclude-dir=.git")
-            return result.stdout[:20000] if result.exit_code == 0 else "(no matches)"
+            quoted = shlex.quote(query)
+            result = sandbox.exec(f"grep -rn {quoted} . --exclude-dir=.git")
+            if result.exit_code != 0:
+                return "(no matches)"
+            return result.stdout[:20000] if result.stdout.strip() else "(no matches)"
 
         hits: list[str] = []
-        for dirpath, dirnames, filenames in os.walk(root):
+        real_root = os.path.realpath(root)
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            # Prevent descending into symlinked dirs that escape workspace
             dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            # Filter symlinked dirs that point outside
+            filtered = []
+            for d in dirnames:
+                full_dir = os.path.join(dirpath, d)
+                try:
+                    if os.path.islink(full_dir):
+                        real = os.path.realpath(full_dir)
+                        if not (real == real_root or real.startswith(real_root + os.sep)):
+                            continue
+                except OSError:
+                    continue
+                filtered.append(d)
+            dirnames[:] = filtered
             for filename in filenames:
                 if os.path.splitext(filename)[1].lower() in _SKIP_EXT:
                     continue
                 full = os.path.join(dirpath, filename)
                 try:
+                    # Skip symlinked files that escape workspace
+                    if os.path.islink(full):
+                        real = os.path.realpath(full)
+                        if not (real == real_root or real.startswith(real_root + os.sep)):
+                            continue
+                    # Skip hard-linked files that could expose outside content
+                    try:
+                        if os.stat(full).st_nlink > 1:
+                            continue
+                    except OSError:
+                        pass
                     if os.path.getsize(full) > _MAX_FILE_BYTES:
                         continue
                 except OSError:
                     continue
                 rel = os.path.relpath(full, root)
-                hits.extend(self._scan_file(full, rel, query))
+                hits.extend(self._scan_file(full, rel, query, real_root))
                 if len(hits) >= _MAX_RESULTS:
                     break
             if len(hits) >= _MAX_RESULTS:
@@ -75,18 +99,28 @@ class SearchCodeTool(Tool):
         return "\n".join(hits)
 
     @staticmethod
-    def _scan_file(full: str, rel: str, query: str) -> list[str]:
+    def _scan_file(full: str, rel: str, query: str, real_root: str | None = None) -> list[str]:
+        # If real_root provided, double-check file still inside after symlink check
+        if real_root is not None:
+            try:
+                real = os.path.realpath(full)
+                if not (real == real_root or real.startswith(real_root + os.sep)):
+                    return []
+            except OSError:
+                return []
         try:
+            out = []
             with open(full, "r", encoding="utf-8", errors="replace") as handle:
-                lines = handle.readlines()
+                for lineno, line in enumerate(handle):
+                    if query in line:
+                        out.append(f"{rel}:{lineno}: {line.rstrip()[:300]}")
+                        if len(out) >= _MAX_RESULTS:
+                            break
+                    # Avoid scanning huge files line-by-line indefinitely
+                    if lineno > 10000:
+                        break
         except OSError:
             return []
-        out = []
-        for lineno, line in enumerate(lines, start=1):
-            if query in line:
-                out.append(f"{rel}:{lineno}: {line.rstrip()[:300]}")
-                if len(out) >= _MAX_RESULTS:
-                    break
         return out
 
 
@@ -115,11 +149,37 @@ class FindFileTool(Tool):
             return result.stdout[:20000] if result.exit_code == 0 else "(no matches)"
 
         matches = []
-        for dirpath, dirnames, filenames in os.walk(root):
+        real_root = os.path.realpath(root)
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            filtered = []
+            for d in dirnames:
+                full_dir = os.path.join(dirpath, d)
+                try:
+                    if os.path.islink(full_dir):
+                        real = os.path.realpath(full_dir)
+                        if not (real == real_root or real.startswith(real_root + os.sep)):
+                            continue
+                except OSError:
+                    continue
+                filtered.append(d)
+            dirnames[:] = filtered
             for filename in filenames:
+                full = os.path.join(dirpath, filename)
+                try:
+                    if os.path.islink(full):
+                        real = os.path.realpath(full)
+                        if not (real == real_root or real.startswith(real_root + os.sep)):
+                            continue
+                    try:
+                        if os.stat(full).st_nlink > 1:
+                            continue
+                    except OSError:
+                        pass
+                except OSError:
+                    continue
                 if pattern in filename:
-                    matches.append(os.path.relpath(os.path.join(dirpath, filename), root))
+                    matches.append(os.path.relpath(full, root))
                     if len(matches) >= _MAX_RESULTS:
                         return "\n".join(matches)
         return "\n".join(matches) or "(no matches)"

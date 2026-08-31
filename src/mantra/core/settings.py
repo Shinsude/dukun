@@ -65,8 +65,8 @@ def path() -> Path:
 def settings_path() -> Path:
     """Public name for the file the user may edit by hand."""
     override = os.environ.get(_OVERRIDE_ENV)
-    if override:
-        return Path(override)
+    if override and override.strip():
+        return Path(override.strip())
     return Path.home() / ".mantra" / "config.json"
 
 

@@ -1,7 +1,4 @@
-"""The agent loop: the only stateful orchestrator in the harness.
-
-Dependencies arrive fully constructed (dependency injection); the loop
-knows interfaces, never concrete implementations.
+"""Stateful orchestrator. Uses dependency injection and interacts only with interfaces.
 
 Three hooks let a front end turn one-shot grading into an interactive tool
 without the core learning anything about terminals:
@@ -31,10 +28,11 @@ from mantra.interfaces.sandbox import Sandbox
 from mantra.interfaces.tool import Tool
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a coding agent working inside a repository checkout. "
-    "Use the provided tools to explore the code, make changes, and verify "
-    "your work by running commands. When you believe the task is complete, "
-    "reply with a final summary instead of a tool call."
+    "You are an expert senior software engineer in THIS workspace. Provide correct, minimal, working code. "
+    "Never hallucinate APIs, libraries, or syntax; if unsure, say \"I don't know.\" Be direct, no fluff. "
+    "CRITICAL: When user asks to explain the codebase/project/what it does, NEVER ask for GitHub link, "
+    "screenshot, or file upload. You ALREADY have workspace path, file list, and README in Environment. "
+    "First call list_dir . and read README/package.json, then summarize the REAL project you see."
 )
 
 
@@ -119,38 +117,77 @@ class AgentLoop:
                 response = self.llm.chat(
                     context.messages, tools=tool_schemas, on_delta=self.on_delta
                 )
+                # Validate response shape — LLM must return LLMResponse-like
+                if response is None or not hasattr(response, "is_final"):
+                    raise LLMError(f"LLM returned invalid response: {type(response).__name__}")
                 self._absorb_usage(response, metrics)
 
                 if response.is_final:
                     stopped_reason = "final"
                     final_message = response.content
                     # The answer has to reach history too, or the next turn
-                    # cannot see what was just said.
-                    context.append({"role": "assistant", "content": response.content})
+                    # cannot see what was just said. Ensure content is string.
+                    content = response.content if isinstance(response.content, str) else (str(response.content) if response.content is not None else "")
+                    context.append({"role": "assistant", "content": content})
                     break
 
+                # Deduplicate tool_call_ids within the same turn (LLM bug)
+                seen_ids: set[str] = set()
+                dedup_calls = []
+                for c in response.tool_calls or []:
+                    cid = getattr(c, "id", "") or ""
+                    original = cid
+                    counter = 0
+                    while cid in seen_ids:
+                        counter += 1
+                        cid = f"{original}_{counter}" if original else f"call_{counter}"
+                    if cid != getattr(c, "id", ""):
+                        try:
+                            c.id = cid  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    seen_ids.add(cid)
+                    dedup_calls.append(c)
+                # Serialize arguments safely
+                tool_calls_payload = []
+                for call in dedup_calls:
+                    try:
+                        args_json = json.dumps(call.arguments)
+                    except (TypeError, ValueError) as exc:
+                        raise LLMError(f"tool arguments not serializable for '{call.name}': {exc}") from exc
+                    tool_calls_payload.append(
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": args_json,
+                            },
+                        }
+                    )
                 # Record the assistant turn once per model reply.
+                content = response.content if isinstance(response.content, str) else (str(response.content) if response.content else "")
                 context.append(
                     {
                         "role": "assistant",
-                        "content": response.content,
-                        "tool_calls": [
-                            {
-                                "id": call.id,
-                                "type": "function",
-                                "function": {
-                                    "name": call.name,
-                                    "arguments": json.dumps(call.arguments),
-                                },
-                            }
-                            for call in response.tool_calls
-                        ],
+                        "content": content,
+                        "tool_calls": tool_calls_payload,
                     }
                 )
 
-                for call in response.tool_calls:
+                for idx, call in enumerate(dedup_calls):
                     if self.aborted:
                         stopped_reason = "aborted"
+                        # Avoid orphan: add aborted observations for remaining calls
+                        for remaining in dedup_calls[idx:]:
+                            context.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": remaining.id,
+                                    "name": remaining.name,
+                                    "content": "ERROR: interrupted by operator",
+                                }
+                            )
                         break
                     observation = self._dispatch_tool(task_id, steps, call, metrics)
                     context.append(
@@ -172,7 +209,17 @@ class AgentLoop:
         except (LLMError, SandboxError, ToolError) as exc:
             stopped_reason = "error"
             final_message = f"mantra error: {exc}"
-            self._emit("run_error", {"task_id": task_id, "error": str(exc)})
+            try:
+                self._emit("run_error", {"task_id": task_id, "error": str(exc)})
+            except Exception:
+                pass
+        except Exception as exc:  # noqa: BLE001 - ensure RunResult even on unexpected crash
+            stopped_reason = "error"
+            final_message = f"mantra error: {exc}"
+            try:
+                self._emit("run_error", {"task_id": task_id, "error": str(exc)})
+            except Exception:
+                pass
         finally:
             if aborted or stopped_reason == "aborted":
                 evaluation = EvaluationResult(
@@ -209,16 +256,20 @@ class AgentLoop:
         self, task_id: str, step: int, call, metrics: dict[str, float]
     ) -> str:
         """Approve, then execute one tool call; every failure is an observation."""
-        if self.approver is not None and not self.approver.check(call.name, call.arguments):
-            metrics["denied"] += 1
-            self._emit(
-                "tool_denied",
-                {"task_id": task_id, "step": step, "tool": call.name},
-            )
-            return (
-                f"ERROR: the operator denied '{call.name}'. Do not retry it; "
-                "explain what you would have done and ask, or use another approach."
-            )
+        try:
+            if self.approver is not None and not self.approver.check(call.name, call.arguments):
+                metrics["denied"] += 1
+                self._emit(
+                    "tool_denied",
+                    {"task_id": task_id, "step": step, "tool": call.name},
+                )
+                return (
+                    f"ERROR: the operator denied '{call.name}'. Do not retry it; "
+                    "explain what you would have done and ask, or use another approach."
+                )
+        except Exception as exc:  # noqa: BLE001 - approver must not crash run
+            metrics["tool_errors"] += 1
+            return f"ERROR: approval check failed for '{call.name}': {exc}"
         return self._execute_tool(task_id, step, call, metrics)
 
     def _execute_tool(
@@ -236,11 +287,13 @@ class AgentLoop:
         started = time.monotonic()
         try:
             observation = tool.execute(self.sandbox, **call.arguments)
+        except AbortError:
+            raise
         except TypeError as exc:
             observation = f"ERROR: bad arguments for '{call.name}': {exc}"
         except Exception as exc:  # noqa: BLE001 - surface to the agent
             observation = f"ERROR: tool '{call.name}' failed: {exc}"
-        if isinstance(observation, str) and observation.startswith("ERROR"):
+        if str(observation).startswith("ERROR"):
             metrics["tool_errors"] += 1
         # Include observation for file-edit tools so the UI can show diffs.
         result_payload: dict = {
@@ -270,24 +323,41 @@ class AgentLoop:
     def _absorb_usage(self, response, metrics: dict[str, float]) -> None:
         usage = getattr(response, "usage", None)
         if not isinstance(usage, dict):
-            return
-        prompt = usage.get("prompt_tokens")
-        completion = usage.get("completion_tokens")
-        if isinstance(prompt, (int, float)):
+            # Some gateways return usage as object with attributes
+            try:
+                usage = dict(usage)  # type: ignore[arg-type]
+            except Exception:
+                return
+            if not isinstance(usage, dict):
+                return
+        def _to_int(v: Any) -> int | None:
+            if isinstance(v, (int, float)):
+                iv = int(v)
+                return iv if iv >= 0 else None
+            if isinstance(v, str) and v.strip().lstrip("-").isdigit():
+                try:
+                    iv = int(v.strip())
+                    return iv if iv >= 0 else None
+                except ValueError:
+                    return None
+            return None
+        prompt = _to_int(usage.get("prompt_tokens"))
+        completion = _to_int(usage.get("completion_tokens"))
+        if prompt is not None:
             metrics["tokens_in"] = metrics.get("tokens_in", 0) + prompt
-        if isinstance(completion, (int, float)):
+        if completion is not None:
             metrics["tokens_out"] = metrics.get("tokens_out", 0) + completion
         # Prompt caching: providers report cached_tokens inside the usage
         # object.  The field lives at different nesting depths depending on
         # the provider (OpenAI uses prompt_tokens_details.cached_tokens,
         # some others flatten it), so we check both levels.
-        cached = 0
+        cached = None
         details = usage.get("prompt_tokens_details")
         if isinstance(details, dict):
-            cached = details.get("cached_tokens", 0) or 0
+            cached = _to_int(details.get("cached_tokens", 0))
         elif "cached_tokens" in usage:
-            cached = usage.get("cached_tokens", 0) or 0
-        if isinstance(cached, (int, float)):
+            cached = _to_int(usage.get("cached_tokens", 0))
+        if cached is not None:
             metrics["cache_hit"] = metrics.get("cache_hit", 0) + cached
 
     def _render_task(self, task: dict[str, Any]) -> str:
@@ -302,8 +372,14 @@ class AgentLoop:
         return "\n\n".join(parts)
 
     def _emit(self, event: str, payload: dict[str, Any]) -> None:
-        self.events.emit(event, payload)
-        self.logger.log(event, payload)
+        try:
+            self.events.emit(event, payload)
+        except Exception:
+            pass
+        try:
+            self.logger.log(event, payload)
+        except Exception:
+            pass
 
 
 def _result_payload(result: RunResult) -> dict[str, Any]:
