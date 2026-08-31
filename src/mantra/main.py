@@ -57,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
 
     llm = build_llm(config["llm"])
     sandbox = build_sandbox(config["sandbox"])
-    tools = build_tools(config["tools"])
+    tools = build_tools(config["tools"], plugins=config.get("plugins"))
     evaluator = build_evaluator(config["evaluator"])
     logger = build_logger(config["logging"])
     events = EventBus()

@@ -9,6 +9,7 @@ from typing import Any
 
 from mantra.interfaces.sandbox import Sandbox
 from mantra.interfaces.tool import Tool
+from mantra.implementations.tools.edit_ledger import TRUNCATION_MARKER, was_clipped
 
 _SHELL_META_RE = re.compile(r"[;&|`$()<>]")
 
@@ -37,9 +38,9 @@ class ReadFileTool(Tool):
         except Exception as exc:  # noqa: BLE001
             return f"ERROR: cannot read {path}: {exc}"
         if self.ledger is not None:
-            self.ledger.remember(path, content)
+            self.ledger.remember(path, content, truncated=was_clipped(content))
         if len(content) > _MAX_READ_CHARS:
-            content = content[:_MAX_READ_CHARS] + "\n... [truncated]"
+            content = content[:_MAX_READ_CHARS] + TRUNCATION_MARKER
         return content
 
 
@@ -104,9 +105,9 @@ class EditFileTool(Tool):
             content = sandbox.read_file(path)
         except Exception as exc:  # noqa: BLE001
             return f"ERROR: cannot read {path}: {exc}"
-        if "[truncated]" in content:
-            return f"ERROR: {path} is too large to edit with edit_file (content truncated); use write_file with complete content"
         if self.ledger is not None:
+            if self.ledger.was_truncated(path):
+                return f"ERROR: {path} is too large to edit with edit_file (content truncated); use write_file with complete content"
             if not self.ledger.has_seen(path):
                 return (
                     f"ERROR: read {path} with read_file before editing "
@@ -117,6 +118,8 @@ class EditFileTool(Tool):
                     f"ERROR: {path} changed on disk since your last read - "
                     "read it again, then retry the edit"
                 )
+        elif was_clipped(content):
+            return f"ERROR: {path} is too large to edit with edit_file (content truncated); use write_file with complete content"
         else:
             # No ledger is wiring bug; fail closed.
             return "ERROR: edit ledger not configured"

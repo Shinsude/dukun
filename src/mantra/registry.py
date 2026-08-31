@@ -1,12 +1,25 @@
-"""Registry: map config names to classes; extend without core changes."""
+"""Registry: map config names to classes; extend without core changes.
+
+Third-party tools can be registered from plain ``.py`` files in plugin
+directories. Listing a directory in the ``MANTRA_PLUGINS`` environment
+variable (path-separated) or in the config ``plugins`` array makes every
+``Tool`` subclass defined there available by name to ``build_tools``.
+The code in a plugin runs in this process, so treat plugin directories
+like any other trusted code you add to the package.
+"""
 
 from __future__ import annotations
 
+import importlib.util
 import inspect
+import os
+from typing import Iterable
 
 from mantra.core.exceptions import ConfigError
 from mantra.implementations.evaluators.command_evaluator import CommandEvaluator
 from mantra.implementations.evaluators.null_evaluator import NullEvaluator
+from mantra.implementations.llm.anthropic_client import AnthropicClient
+from mantra.implementations.llm.gemini_client import GeminiClient
 from mantra.implementations.llm.mock_client import ScriptedLLMClient
 from mantra.implementations.llm.openai_client import OpenAICompatClient
 from mantra.implementations.loggers.jsonl_logger import JsonlLogger
@@ -33,6 +46,9 @@ from mantra.interfaces.tool import Tool
 
 LLM_REGISTRY: dict[str, type[LLMClient]] = {
     "openai": OpenAICompatClient,
+    "anthropic": AnthropicClient,
+    "gemini": GeminiClient,
+    "google": GeminiClient,
     "scripted": ScriptedLLMClient,
 }
 
@@ -68,6 +84,76 @@ TOOL_REGISTRY: dict[str, type[Tool]] = {
 # Alias without underscore for usability.
 TOOL_REGISTRY["webfetch"] = WebFetchTool
 
+# Directories whose *.py files are loaded as tool plugins.
+PLUGIN_ENV = "MANTRA_PLUGINS"
+
+
+def plugin_dirs(config_plugins: Iterable[str] | None = None) -> list[str]:
+    """Plugin directories from the environment and the config, in order."""
+    dirs: list[str] = []
+    env = os.environ.get(PLUGIN_ENV, "")
+    if env.strip():
+        for piece in env.split(os.pathsep):
+            piece = piece.strip()
+            if piece:
+                dirs.append(piece)
+    for entry in config_plugins or []:
+        if isinstance(entry, str) and entry.strip():
+            dirs.append(entry.strip())
+    return dirs
+
+
+def load_plugins(config_plugins: Iterable[str] | None = None) -> list[str]:
+    """Register Tool subclasses found in plugin directories.
+
+    Returns the names of tools that were added. Already-registered names
+    raise ConfigError rather than silently shadowing a built-in.
+    """
+    added: list[str] = []
+    for directory in plugin_dirs(config_plugins):
+        added.extend(_load_plugin_dir(directory))
+    return added
+
+
+def _load_plugin_dir(directory: str) -> list[str]:
+    directory = os.path.expanduser(directory)
+    if not os.path.isdir(directory):
+        raise ConfigError(f"plugin directory not found: {directory}")
+    added: list[str] = []
+    files = sorted(
+        name for name in os.listdir(directory)
+        if name.endswith(".py") and not name.startswith("_")
+    )
+    if not files:
+        return added
+    for name in files:
+        module_name = f"mantra_plugin_{name[:-3]}"
+        full = os.path.join(directory, name)
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, full)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception as exc:  # noqa: BLE001
+            raise ConfigError(f"plugin '{name}' failed to load: {exc}") from exc
+        candidates = list(vars(module).values())
+        declared = getattr(module, "tools", None)
+        if declared is not None:
+            candidates = candidates + list(declared)
+        for value in candidates:
+            if not (isinstance(value, type) and issubclass(value, Tool)):
+                continue
+            if value is Tool or not value.name:
+                continue
+            if value.name in TOOL_REGISTRY:
+                raise ConfigError(
+                    f"plugin '{name}' defines tool '{value.name}', which already exists"
+                )
+            TOOL_REGISTRY[value.name] = value
+            added.append(value.name)
+    return added
+
 
 def build_llm(config: dict) -> LLMClient:
     kind = config.get("provider")
@@ -101,9 +187,16 @@ def build_logger(config: dict) -> Logger:
     return _construct(cls, config)
 
 
-def build_tools(names: list[str]) -> list[Tool]:
-    """Create tools by name; share one EditLedger; dedupe aliases."""
+def build_tools(names: list[str], plugins: Iterable[str] | None = None) -> list[Tool]:
+    """Create tools by name; share one EditLedger; dedupe aliases.
+
+    When ``plugins`` lists directories, their Tool subclasses become
+    available first (also honouring the MANTRA_PLUGINS env var).
+    """
     from mantra.implementations.tools.edit_ledger import EditLedger
+
+    # Env var dirs load even when no config plugins are listed.
+    load_plugins(plugins)
 
     ledger = EditLedger()
     seen_classes: set[type[Tool]] = set()

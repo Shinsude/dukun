@@ -23,6 +23,7 @@ DEFAULTS = {
         "reasoning_effort": None,
     },
     "sandbox": {"provider": "local"},
+    "plugins": [],
     "tools": [
         "read_file",
         "write_file",
@@ -113,6 +114,11 @@ def merge_defaults(data: dict) -> dict:
     bad_tool = next((t for t in tools if not isinstance(t, str) or not t.strip()), _sentinel)
     if bad_tool is not _sentinel:
         raise ConfigError(f"config tools must be non-empty names, got {bad_tool!r}")
+    plugins = merged.get("plugins")
+    if not isinstance(plugins, (list, tuple)):
+        raise ConfigError("config plugins must be a list of directories")
+    if any(not isinstance(p, str) or not p.strip() for p in plugins):
+        raise ConfigError("config plugins must be non-empty strings")
     steps = merged.get("max_steps", 30)
     if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
         raise ConfigError(f"config max_steps must be a positive integer, got {steps!r}")

@@ -21,27 +21,45 @@ _SKIP_EXT = {".pyc", ".pyo", ".so", ".dll", ".exe", ".bin", ".zip", ".tar", ".gz
 class SearchCodeTool(Tool):
     name = "search_code"
     description = (
-        "Search for a literal substring across text files in the workspace. "
+        "Search across text files in the workspace. By default the query is a "
+        "literal substring; set 'regex' to true to treat it as a "
+        "case-insensitive Python regular expression. "
         "Returns matching lines prefixed with 'path:line'."
     )
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Literal text to find"}
+            "query": {"type": "string", "description": "Literal text or regular expression to find"},
+            "regex": {
+                "type": "boolean",
+                "description": "Treat query as a regular expression",
+                "default": False,
+            },
         },
         "required": ["query"],
     }
 
-    def execute(self, sandbox: Sandbox, query: str) -> str:
+    def execute(self, sandbox: Sandbox, query: str, regex: bool | None = None) -> str:
         if "\x00" in query or "\n" in query or "\r" in query:
             return "ERROR: query contains invalid characters"
         if len(query) > 500:
             return "ERROR: query too long"
+        use_regex = bool(regex)
+        pattern = None
+        if use_regex:
+            try:
+                pattern = re.compile(query)
+            except re.error as exc:
+                return f"ERROR: invalid regex: {exc}"
         root = getattr(sandbox, "root", None)
         if root is None:
             # Fall back to shell grep for sandboxes without a file view.
             quoted = shlex.quote(query)
-            result = sandbox.exec(f"grep -rn {quoted} . --exclude-dir=.git")
+            if use_regex:
+                flag = "-nE" if re.search(r"[A-Z]", query) else "-niE"
+            else:
+                flag = "-n"
+            result = sandbox.exec(f"grep -r{flag} {quoted} . --exclude-dir=.git")
             if result.exit_code != 0:
                 return "(no matches)"
             return result.stdout[:20000] if result.stdout.strip() else "(no matches)"
@@ -87,7 +105,7 @@ class SearchCodeTool(Tool):
                 if scanned > 3000:
                     break
                 rel = os.path.relpath(full, root)
-                hits.extend(self._scan_file(full, rel, query, real_root))
+                hits.extend(self._scan_file(full, rel, query, real_root, pattern))
                 if len(hits) >= _MAX_RESULTS:
                     break
             if len(hits) >= _MAX_RESULTS or scanned > 3000:
@@ -97,7 +115,13 @@ class SearchCodeTool(Tool):
         return "\n".join(hits)
 
     @staticmethod
-    def _scan_file(full: str, rel: str, query: str, real_root: str | None = None) -> list[str]:
+    def _scan_file(
+        full: str,
+        rel: str,
+        query: str,
+        real_root: str | None = None,
+        pattern: re.Pattern | None = None,
+    ) -> list[str]:
         # If real_root provided, double-check file still inside after symlink check
         if real_root is not None:
             try:
@@ -110,7 +134,11 @@ class SearchCodeTool(Tool):
             out = []
             with open(full, "r", encoding="utf-8", errors="replace") as handle:
                 for lineno, line in enumerate(handle):
-                    if query in line:
+                    if pattern is not None:
+                        matched = pattern.search(line) is not None
+                    else:
+                        matched = query in line
+                    if matched:
                         out.append(f"{rel}:{lineno}: {line.rstrip()[:300]}")
                         if len(out) >= _MAX_RESULTS:
                             break
