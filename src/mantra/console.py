@@ -2073,7 +2073,7 @@ class ConsoleCompleter:
         """Re-index the workspace once per prompt, not once per keystroke."""
         root = os.path.abspath(self.session.sandbox.root)
         now = time.monotonic()
-        if self._indexed and root == self._cache_root and (now - self._cache_time) < 1.5:
+        if self._indexed and root == self._cache_root and (now - self._cache_time) < 0.5:
             return
         entries: list[str] = []
         try:
@@ -2111,10 +2111,10 @@ class ConsoleCompleter:
         token = buffer[start:cursor]
         if token.startswith("@"):
             return self._complete_path(start, cursor, token[1:])
-        # Slash commands: allow leading whitespace, but only when the slash
+        # Slash commands: allow leading whitespace and invisible chars, but only when the slash
         # token is the first non-space token (so "hello /help" does not
         # trigger, but "  /help" does).
-        if token.startswith("/") and buffer[:start].strip() == "":
+        if token.startswith("/") and buffer[:start].lstrip("\ufeff\u200b\u00a0").strip() == "":
             return self._complete_command(cursor, token, start)
         # Sub-command completions: use lstrip so leading spaces don't break
         # them (operator may indent). Keep start-based token for replacement.
@@ -3570,9 +3570,10 @@ def _needs_first_run(session: "ConsoleSession") -> bool:
 
 def dispatch(session: ConsoleSession, line: str) -> bool:
     """Run a slash command. Returns True when the line was a command."""
-    if not line.startswith("/"):
+    stripped = line.lstrip("\ufeff\u200b\u00a0 \t\r\n")
+    if not stripped.startswith("/"):
         return False
-    parts = line.split(None, 1)
+    parts = stripped.split(None, 1)
     command = parts[0].lower()
     argument = parts[1].strip() if len(parts) > 1 else ""
 
@@ -3951,13 +3952,13 @@ def repl(session: ConsoleSession, style: Style, reader: Any = None) -> None:
                 editor.fixed_row = session.layout.prompt_row
 
             if fixed_bottom:
-                line = reader(session.prompt_text(), skip_newline=True).strip()
+                line = reader(session.prompt_text(), skip_newline=True).strip("﻿​  \t\r\n")
                 # Prompt owned by LineEditor — layout does not redraw here
             elif session.frame is not None:
                 session.frame.row("")
-                line = reader(session.prompt_text()).strip()
+                line = reader(session.prompt_text()).strip("﻿​  \t\r\n")
             else:
-                line = reader(f"\n{session.prompt_text()}").strip()
+                line = reader(f"\n{session.prompt_text()}").strip("﻿​  \t\r\n")
         except (KeyboardInterrupt, EOFError):
             return
         if not line:
